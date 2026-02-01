@@ -18,6 +18,7 @@ export default function Play() {
     const [started, setStarted] = useState(false);
     const [history, setHistory] = useState([]);
     const [currentQuestion, setCurrentQuestion] = useState(null);
+    const [currentQuestionMeta, setCurrentQuestionMeta] = useState(null);
     const [loading, setLoading] = useState(false);
     const [prediction, setPrediction] = useState(null);
     const [confirming, setConfirming] = useState(false);
@@ -43,6 +44,10 @@ export default function Play() {
             const response = await sendGameMove(currentHistory, nextRejectedGuesses);
             if (response.type === 'question') {
                 setCurrentQuestion(response.content);
+                setCurrentQuestionMeta({
+                    question_id: response.question_id ?? null,
+                    feature_id: response.feature_id ?? null,
+                });
                 setPrediction(null);
                 setGuessFeedback(null);
                 setReviewRequired(false);
@@ -52,6 +57,7 @@ export default function Play() {
             } else if (response.type === 'guess') {
                 setPrediction(response);
                 setCurrentQuestion(null);
+                setCurrentQuestionMeta(null);
                 setGuessFeedback(null);
                 setReviewRequired(false);
                 setVerification(null);
@@ -77,7 +83,15 @@ export default function Play() {
 
     const handleAnswer = async (answer) => {
         if (!currentQuestion) return;
-        const newHistory = [...history, { question: currentQuestion, answer }];
+        const newHistory = [
+            ...history,
+            {
+                question: currentQuestion,
+                answer,
+                question_id: currentQuestionMeta?.question_id ?? null,
+                feature_id: currentQuestionMeta?.feature_id ?? null,
+            }
+        ];
         setHistory(newHistory);
         await fetchNextMove(newHistory);
     };
@@ -86,6 +100,7 @@ export default function Play() {
         setStarted(false);
         setHistory([]);
         setCurrentQuestion(null);
+        setCurrentQuestionMeta(null);
         setPrediction(null);
         setConfirming(false);
         setGuessFeedback(null);
