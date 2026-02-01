@@ -1163,8 +1163,12 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔑 DeepSeek API: ${process.env.DEEPSEEK_API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`🔍 Serper API: ${SERPER_API_KEY && SERPER_API_KEY !== 'YOUR_SERPER_API_KEY_HERE' ? '✅ Configured' : '⚠️ Not configured (optional)'}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🔑 DeepSeek API: ${process.env.DEEPSEEK_API_KEY ? '✅ Configured' : '❌ Missing'}`);
+    console.log(`🔍 Serper API: ${SERPER_API_KEY && SERPER_API_KEY !== 'YOUR_SERPER_API_KEY_HERE' ? '✅ Configured' : '⚠️ Not configured (optional)'}`);
+  });
+}
+
+module.exports = app;
