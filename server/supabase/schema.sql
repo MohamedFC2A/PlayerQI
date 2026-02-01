@@ -2,6 +2,18 @@ create extension if not exists pgcrypto;
 create extension if not exists pg_trgm;
 create extension if not exists vector;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public' and t.typname = 'answer_kind'
+  ) then
+    create type public.answer_kind as enum ('yes','no','unknown','maybe');
+  end if;
+end $$;
+
 create table if not exists public.candidates (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
@@ -80,18 +92,36 @@ where embedding is not null;
 create table if not exists public.player_features (
   player_id uuid not null references public.candidates(id) on delete cascade,
   feature_id uuid not null references public.features(id) on delete cascade,
+  answer public.answer_kind not null default 'yes',
   source text,
   confidence numeric,
   created_at timestamptz not null default now(),
   primary key (player_id, feature_id)
 );
 
+alter table public.player_features
+add column if not exists answer public.answer_kind;
+
+alter table public.player_features
+alter column answer set default 'yes'::public.answer_kind;
+
+update public.player_features
+set answer = 'yes'::public.answer_kind
+where answer is null;
+
+alter table public.player_features
+alter column answer set not null;
+
 create index if not exists player_features_feature_id
 on public.player_features(feature_id, player_id);
+
+create index if not exists player_features_feature_answer
+on public.player_features(feature_id, answer, player_id);
 
 create table if not exists public.game_sessions (
   id uuid primary key default gen_random_uuid(),
   history jsonb not null default '[]'::jsonb,
+  rejected_guess_names text[] not null default '{}'::text[],
   status text not null default 'in_progress' check (status in ('in_progress','won','lost','abandoned')),
   guessed_candidate_id uuid references public.candidates(id) on delete set null,
   guessed_name text,
@@ -102,6 +132,19 @@ create table if not exists public.game_sessions (
   updated_at timestamptz not null default now()
 );
 
+alter table public.game_sessions
+add column if not exists rejected_guess_names text[];
+
+alter table public.game_sessions
+alter column rejected_guess_names set default '{}'::text[];
+
+update public.game_sessions
+set rejected_guess_names = '{}'::text[]
+where rejected_guess_names is null;
+
+alter table public.game_sessions
+alter column rejected_guess_names set not null;
+
 create table if not exists public.game_moves (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.game_sessions(id) on delete cascade,
@@ -109,12 +152,24 @@ create table if not exists public.game_moves (
   question_id uuid references public.questions_metadata(id) on delete set null,
   feature_id uuid references public.features(id) on delete set null,
   answer boolean,
+  answer_kind public.answer_kind,
   candidate_count_before integer,
   candidate_count_after integer,
   info_gain numeric,
   created_at timestamptz not null default now(),
   constraint game_moves_session_move_unique unique(session_id, move_index)
 );
+
+alter table public.game_moves
+add column if not exists answer_kind public.answer_kind;
+
+update public.game_moves
+set answer_kind = case
+  when answer is true then 'yes'::public.answer_kind
+  when answer is false then 'no'::public.answer_kind
+  else null
+end
+where answer_kind is null and answer is not null;
 
 create index if not exists game_moves_session_lookup
 on public.game_moves(session_id, move_index);
@@ -253,18 +308,20 @@ declare
   asked_feature_keys text[];
   asked_question_norms text[];
   n integer;
-  total_w numeric;
-  total_w_ln_w numeric;
+  total_w double precision;
+  total_w_ln_w double precision;
   top_candidate_id uuid;
   top_candidate_name text;
-  top_candidate_w numeric;
-  top_prob numeric;
-  entropy_before numeric;
+  top_candidate_w double precision;
+  top_prob double precision;
+  entropy_before double precision;
   best_feature_id uuid;
   best_question_id uuid;
   best_question_text text;
-  best_info_gain numeric;
-  best_score numeric;
+  best_info_gain double precision;
+  best_score double precision;
+  best_missing_n integer;
+  best_missing_players jsonb;
 begin
   with
     h_raw as (
@@ -272,73 +329,104 @@ begin
         nullif(x->>'feature_id', '')::uuid as feature_id,
         nullif(x->>'normalized_question', '') as normalized_question,
         case
-          when (x ? 'answer_bool') then (x->>'answer_bool')::boolean
-          when (x ? 'answer') and trim(x->>'answer') in ('yes','no') then (trim(x->>'answer') = 'yes')
-          when (x ? 'answer') and trim(x->>'answer') in ('نعم','لا') then (trim(x->>'answer') = 'نعم')
+          when x ? 'answer_kind' then lower(trim(x->>'answer_kind'))
+          when x ? 'answer' then lower(trim(x->>'answer'))
           else null
-        end as answer_bool
+        end as answer_text
       from jsonb_array_elements(coalesce(current_history, '[]'::jsonb)) as x
+    ),
+    h_kind as (
+      select
+        hr.feature_id,
+        hr.normalized_question,
+        case
+          when hr.answer_text in ('yes','y','true','نعم') then 'yes'::public.answer_kind
+          when hr.answer_text in ('no','n','false','لا') then 'no'::public.answer_kind
+          when hr.answer_text in ('maybe','ربما','جزئيا','جزئياً') then 'maybe'::public.answer_kind
+          when hr.answer_text in ('unknown','idk','لا اعرف','لا أعرف') then 'unknown'::public.answer_kind
+          else null
+        end as answer_kind
+      from h_raw hr
     ),
     h_resolved as (
       select
-        coalesce(hr.feature_id, mq.feature_id) as feature_id,
-        hr.answer_bool as answer_bool
-      from h_raw hr
+        coalesce(hk.feature_id, mq.feature_id) as feature_id,
+        hk.answer_kind as answer_kind,
+        hk.normalized_question as normalized_question
+      from h_kind hk
       left join lateral (
         select m.feature_id
-        from public.match_question_metadata(hr.normalized_question, 0.88) m
+        from public.match_question_metadata(hk.normalized_question, 0.88) m
         limit 1
-      ) mq on hr.feature_id is null and hr.normalized_question is not null
+      ) mq on hk.feature_id is null and hk.normalized_question is not null
+      where coalesce(hk.feature_id, mq.feature_id) is not null and hk.answer_kind is not null
     ),
     h_all as (
       select distinct feature_id
       from h_resolved
-      where feature_id is not null
     ),
-    h as (
-      select distinct feature_id, answer_bool
+    asked_keys as (
+      select distinct f.normalized_key
+      from public.features f
+      where f.id = any((select array_agg(feature_id) from h_all))
+    ),
+    asked_q_norms as (
+      select distinct normalized_question
       from h_resolved
-      where feature_id is not null and answer_bool is not null
+      where normalized_question is not null and normalized_question <> ''
     ),
-    h_yes as (
-      select feature_id from h where answer_bool = true
+    h_for_weighting as (
+      select distinct feature_id, answer_kind
+      from h_resolved
+      where answer_kind <> 'unknown'
     ),
-    h_no as (
-      select feature_id from h where answer_bool = false
-    ),
-    yes_counts as (
-      select pf.player_id, count(*) as yes_hits
-      from public.player_features pf
-      join h_yes hy on hy.feature_id = pf.feature_id
-      group by pf.player_id
-    ),
-    remaining as (
+    base as (
       select
         c.id,
         c.name,
         c.normalized_name,
         c.image_url,
-        c.prior_weight as w,
-        (c.prior_weight * ln(greatest(c.prior_weight, 1e-9))) as w_ln_w
+        c.prior_weight::double precision as prior_w
       from public.candidates c
-      left join public.player_features pf_no
-        on pf_no.player_id = c.id
-       and pf_no.feature_id in (select feature_id from h_no)
-      left join yes_counts yc on yc.player_id = c.id
-      where pf_no.player_id is null
-        and coalesce(yc.yes_hits, 0) = (select count(*) from h_yes)
-        and (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
+      where (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
+    ),
+    remaining as (
+      select
+        b.id,
+        b.name,
+        b.normalized_name,
+        b.image_url,
+        (b.prior_w * exp(coalesce(sum(ln(greatest(
+          case h.answer_kind
+            when 'yes' then case pf.answer when 'yes' then 1::double precision when 'no' then 1e-6::double precision else 0.5::double precision end
+            when 'no' then case pf.answer when 'yes' then 1e-6::double precision when 'no' then 1::double precision else 0.5::double precision end
+            when 'maybe' then case pf.answer when 'yes' then 0.8::double precision when 'no' then 0.2::double precision else 0.6::double precision end
+            else 1::double precision
+          end
+        , 1e-9::double precision))), 0))) as w
+      from base b
+      left join h_for_weighting h on true
+      left join public.player_features pf
+        on pf.player_id = b.id and pf.feature_id = h.feature_id
+      group by b.id, b.name, b.normalized_name, b.image_url, b.prior_w
+    ),
+    remaining2 as (
+      select
+        r.*,
+        (r.w * ln(greatest(r.w, 1e-12))) as w_ln_w
+      from remaining r
+      where r.w > 0
     )
   select
     (select array_agg(feature_id) from h_all),
-    (select array_agg(distinct f.normalized_key) from public.features f where f.id = any((select array_agg(feature_id) from h_all))),
-    (select array_agg(distinct hr.normalized_question) from h_raw hr where hr.normalized_question is not null and hr.normalized_question <> ''),
-    (select count(*) from remaining),
-    (select coalesce(sum(w), 0) from remaining),
-    (select coalesce(sum(w_ln_w), 0) from remaining),
-    (select id from remaining order by w desc, name asc limit 1),
-    (select name from remaining order by w desc, name asc limit 1),
-    (select w from remaining order by w desc, name asc limit 1)
+    (select array_agg(normalized_key) from asked_keys),
+    (select array_agg(normalized_question) from asked_q_norms),
+    (select count(*) from remaining2),
+    (select coalesce(sum(w), 0) from remaining2),
+    (select coalesce(sum(w_ln_w), 0) from remaining2),
+    (select id from remaining2 order by w desc, name asc limit 1),
+    (select name from remaining2 order by w desc, name asc limit 1),
+    (select w from remaining2 order by w desc, name asc limit 1)
   into
     asked_feature_ids,
     asked_feature_keys,
@@ -351,10 +439,7 @@ begin
     top_candidate_w;
 
   if n is null or n = 0 then
-    return jsonb_build_object(
-      'type', 'gap',
-      'reason', 'no_candidates'
-    );
+    return jsonb_build_object('type', 'gap', 'reason', 'no_candidates');
   end if;
 
   if total_w <= 0 then
@@ -363,7 +448,7 @@ begin
     top_prob := coalesce(top_candidate_w, 0) / total_w;
   end if;
 
-  entropy_before := public.entropy_from_sums(total_w, total_w_ln_w);
+  entropy_before := public.entropy_from_sums(total_w::numeric, total_w_ln_w::numeric);
 
   if n <= 3 or top_prob >= 0.85 then
     return jsonb_build_object(
@@ -384,65 +469,91 @@ begin
         nullif(x->>'feature_id', '')::uuid as feature_id,
         nullif(x->>'normalized_question', '') as normalized_question,
         case
-          when (x ? 'answer_bool') then (x->>'answer_bool')::boolean
-          when (x ? 'answer') and trim(x->>'answer') in ('yes','no') then (trim(x->>'answer') = 'yes')
-          when (x ? 'answer') and trim(x->>'answer') in ('نعم','لا') then (trim(x->>'answer') = 'نعم')
+          when x ? 'answer_kind' then lower(trim(x->>'answer_kind'))
+          when x ? 'answer' then lower(trim(x->>'answer'))
           else null
-        end as answer_bool
+        end as answer_text
       from jsonb_array_elements(coalesce(current_history, '[]'::jsonb)) as x
+    ),
+    h_kind as (
+      select
+        hr.feature_id,
+        hr.normalized_question,
+        case
+          when hr.answer_text in ('yes','y','true','نعم') then 'yes'::public.answer_kind
+          when hr.answer_text in ('no','n','false','لا') then 'no'::public.answer_kind
+          when hr.answer_text in ('maybe','ربما','جزئيا','جزئياً') then 'maybe'::public.answer_kind
+          when hr.answer_text in ('unknown','idk','لا اعرف','لا أعرف') then 'unknown'::public.answer_kind
+          else null
+        end as answer_kind
+      from h_raw hr
     ),
     h_resolved as (
       select
-        coalesce(hr.feature_id, mq.feature_id) as feature_id,
-        hr.answer_bool as answer_bool
-      from h_raw hr
+        coalesce(hk.feature_id, mq.feature_id) as feature_id,
+        hk.answer_kind as answer_kind,
+        hk.normalized_question as normalized_question
+      from h_kind hk
       left join lateral (
         select m.feature_id
-        from public.match_question_metadata(hr.normalized_question, 0.88) m
+        from public.match_question_metadata(hk.normalized_question, 0.88) m
         limit 1
-      ) mq on hr.feature_id is null and hr.normalized_question is not null
-      where hr.answer_bool is not null
+      ) mq on hk.feature_id is null and hk.normalized_question is not null
+      where coalesce(hk.feature_id, mq.feature_id) is not null and hk.answer_kind is not null
     ),
-    h as (
-      select distinct feature_id, answer_bool
+    h_for_weighting as (
+      select distinct feature_id, answer_kind
       from h_resolved
-      where feature_id is not null
+      where answer_kind <> 'unknown'
     ),
-    h_yes as (
-      select feature_id from h where answer_bool = true
-    ),
-    h_no as (
-      select feature_id from h where answer_bool = false
-    ),
-    yes_counts as (
-      select pf.player_id, count(*) as yes_hits
-      from public.player_features pf
-      join h_yes hy on hy.feature_id = pf.feature_id
-      group by pf.player_id
-    ),
-    remaining as (
+    base as (
       select
         c.id,
         c.name,
-        c.prior_weight as w,
-        (c.prior_weight * ln(greatest(c.prior_weight, 1e-9))) as w_ln_w
+        c.normalized_name,
+        c.image_url,
+        c.prior_weight::double precision as prior_w
       from public.candidates c
-      left join public.player_features pf_no
-        on pf_no.player_id = c.id
-       and pf_no.feature_id in (select feature_id from h_no)
-      left join yes_counts yc on yc.player_id = c.id
-      where pf_no.player_id is null
-        and coalesce(yc.yes_hits, 0) = (select count(*) from h_yes)
-        and (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
+      where (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
+    ),
+    remaining as (
+      select
+        b.id,
+        b.name,
+        b.normalized_name,
+        b.image_url,
+        (b.prior_w * exp(coalesce(sum(ln(greatest(
+          case h.answer_kind
+            when 'yes' then case pf.answer when 'yes' then 1::double precision when 'no' then 1e-6::double precision else 0.5::double precision end
+            when 'no' then case pf.answer when 'yes' then 1e-6::double precision when 'no' then 1::double precision else 0.5::double precision end
+            when 'maybe' then case pf.answer when 'yes' then 0.8::double precision when 'no' then 0.2::double precision else 0.6::double precision end
+            else 1::double precision
+          end
+        , 1e-9::double precision))), 0))) as w
+      from base b
+      left join h_for_weighting h on true
+      left join public.player_features pf
+        on pf.player_id = b.id and pf.feature_id = h.feature_id
+      group by b.id, b.name, b.normalized_name, b.image_url, b.prior_w
+    ),
+    remaining2 as (
+      select
+        r.*,
+        (r.w * ln(greatest(r.w, 1e-12))) as w_ln_w
+      from remaining r
+      where r.w > 0
     ),
     feature_stats as (
       select
         pf.feature_id,
         f.normalized_key,
-        count(*) as yes_n,
-        sum(r.w) as yes_w,
-        sum(r.w_ln_w) as yes_w_ln_w
-      from remaining r
+        count(*) filter (where pf.answer = 'yes') as yes_n,
+        coalesce(sum(r.w) filter (where pf.answer = 'yes'), 0) as yes_w_known,
+        coalesce(sum(r.w_ln_w) filter (where pf.answer = 'yes'), 0) as yes_w_ln_w_known,
+        count(*) filter (where pf.answer = 'no') as no_n,
+        coalesce(sum(r.w) filter (where pf.answer = 'no'), 0) as no_w_known,
+        coalesce(sum(r.w_ln_w) filter (where pf.answer = 'no'), 0) as no_w_ln_w_known
+      from remaining2 r
       join public.player_features pf on pf.player_id = r.id
       join public.features f on f.id = pf.feature_id
       where asked_feature_ids is null or not (pf.feature_id = any(asked_feature_ids))
@@ -453,22 +564,44 @@ begin
         fs.feature_id,
         fs.normalized_key,
         fs.yes_n,
-        (n - fs.yes_n) as no_n,
-        fs.yes_w,
-        (total_w - fs.yes_w) as no_w,
-        fs.yes_w_ln_w,
-        (total_w_ln_w - fs.yes_w_ln_w) as no_w_ln_w,
-        public.entropy_from_sums(total_w, total_w_ln_w) as entropy_before,
-        (fs.yes_w / total_w) * public.entropy_from_sums(fs.yes_w, fs.yes_w_ln_w)
-          + ((total_w - fs.yes_w) / total_w) * public.entropy_from_sums((total_w - fs.yes_w), (total_w_ln_w - fs.yes_w_ln_w)) as expected_entropy
+        fs.no_n,
+        (n - fs.yes_n - fs.no_n) as unknown_n,
+        (fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) as yes_w,
+        (fs.no_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) as no_w,
+        (fs.yes_w_ln_w_known
+          + ((total_w_ln_w - fs.yes_w_ln_w_known - fs.no_w_ln_w_known) / 2)
+          - ((ln(2)::double precision / 2) * (total_w - fs.yes_w_known - fs.no_w_known))
+        ) as yes_w_ln_w,
+        (fs.no_w_ln_w_known
+          + ((total_w_ln_w - fs.yes_w_ln_w_known - fs.no_w_ln_w_known) / 2)
+          - ((ln(2)::double precision / 2) * (total_w - fs.yes_w_known - fs.no_w_known))
+        ) as no_w_ln_w,
+        entropy_before as entropy_before,
+        ((fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) / total_w)
+          * public.entropy_from_sums(
+              (fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2))::numeric,
+              (fs.yes_w_ln_w_known
+                + ((total_w_ln_w - fs.yes_w_ln_w_known - fs.no_w_ln_w_known) / 2)
+                - ((ln(2)::double precision / 2) * (total_w - fs.yes_w_known - fs.no_w_known))
+              )::numeric
+            )
+          + ((fs.no_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) / total_w)
+          * public.entropy_from_sums(
+              (fs.no_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2))::numeric,
+              (fs.no_w_ln_w_known
+                + ((total_w_ln_w - fs.yes_w_ln_w_known - fs.no_w_ln_w_known) / 2)
+                - ((ln(2)::double precision / 2) * (total_w - fs.yes_w_known - fs.no_w_known))
+              )::numeric
+            ) as expected_entropy
       from feature_stats fs
-      where fs.yes_n > 0 and fs.yes_n < n and fs.yes_w > 0 and fs.yes_w < total_w
+      where total_w > 0
+        and (fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) > 0
+        and (fs.no_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) > 0
         and (
           n < 20
           or (
-            fs.yes_w >= (total_w * 0.08) and fs.yes_w <= (total_w * 0.92)
-            and fs.yes_n >= greatest(2, floor(n * 0.08)::int)
-            and fs.yes_n <= (n - greatest(2, floor(n * 0.08)::int))
+            (fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) >= (total_w * 0.08)
+            and (fs.yes_w_known + ((total_w - fs.yes_w_known - fs.no_w_known) / 2)) <= (total_w * 0.92)
           )
         )
     ),
@@ -479,20 +612,40 @@ begin
         qpick.id as question_id,
         qpick.question_text,
         qpick.manual_weight,
-        (1 - (abs((s.yes_w) - (total_w - s.yes_w)) / total_w)) as balance,
+        (1 - (abs((s.yes_w) - (s.no_w)) / total_w)) as balance,
+        (
+          select count(*)
+          from remaining2 r
+          left join public.player_features pf_any
+            on pf_any.player_id = r.id and pf_any.feature_id = s.feature_id
+          where pf_any.player_id is null
+        ) as missing_n,
+        (
+          select coalesce(jsonb_agg(jsonb_build_object('candidate_id', m.id, 'name', m.name)), '[]'::jsonb)
+          from (
+            select r.id, r.name
+            from remaining2 r
+            left join public.player_features pf_any
+              on pf_any.player_id = r.id and pf_any.feature_id = s.feature_id
+            where pf_any.player_id is null
+            order by r.w desc, r.name asc
+            limit 20
+          ) m
+        ) as missing_players,
         case
           when s.normalized_key = 'league' and asked_feature_keys is not null and ('league' = any(asked_feature_keys)) then 0.12
           when asked_feature_keys is not null and (s.normalized_key = any(asked_feature_keys)) then 0.5
           else 1
         end as key_penalty,
         (s.entropy_before - s.expected_entropy)
-          * (1 - (abs((s.yes_w) - (total_w - s.yes_w)) / total_w))
+          * (1 - (abs((s.yes_w) - (s.no_w)) / total_w))
           * (case
               when s.normalized_key = 'league' and asked_feature_keys is not null and ('league' = any(asked_feature_keys)) then 0.12
               when asked_feature_keys is not null and (s.normalized_key = any(asked_feature_keys)) then 0.5
               else 1
             end)
-          * (1 + greatest(-0.95, qpick.manual_weight)) as score
+          * (1 + greatest(-0.95, qpick.manual_weight))
+          * (1 - least(0.95, coalesce(s.unknown_n::double precision / greatest(n, 1), 0))) as score
       from scored s
       join lateral (
         select q.id, q.question_text, q.manual_weight
@@ -509,6 +662,7 @@ begin
         order by q.manual_weight desc, q.success_count desc, q.seen_count desc, q.updated_at desc
         limit 1
       ) qpick on true
+      where (s.entropy_before - s.expected_entropy) >= 0.0003
       order by score desc, info_gain desc
       limit 1
     )
@@ -517,16 +671,20 @@ begin
     b.question_id,
     b.question_text,
     b.info_gain,
-    b.score
+    b.score,
+    b.missing_n,
+    b.missing_players
   into
     best_feature_id,
     best_question_id,
     best_question_text,
     best_info_gain,
-    best_score
+    best_score,
+    best_missing_n,
+    best_missing_players
   from best b;
 
-  if best_feature_id is null or best_question_id is null or best_question_text is null or best_info_gain is null or best_info_gain <= 0.0005 or best_score is null or best_score <= 0.003 then
+  if best_feature_id is null or best_question_id is null or best_question_text is null then
     return jsonb_build_object(
       'type', 'gap',
       'reason', 'no_good_question',
@@ -543,7 +701,7 @@ begin
         select coalesce(jsonb_agg(jsonb_build_object(
           'candidate_id', r.id,
           'name', r.name,
-          'p', (r.w / total_w)
+          'p', (r.w / nullif(total_w, 0))
         )), '[]'::jsonb)
         from (
           with
@@ -552,55 +710,74 @@ begin
                 nullif(x->>'feature_id', '')::uuid as feature_id,
                 nullif(x->>'normalized_question', '') as normalized_question,
                 case
-                  when (x ? 'answer_bool') then (x->>'answer_bool')::boolean
-                  when (x ? 'answer') and trim(x->>'answer') in ('yes','no') then (trim(x->>'answer') = 'yes')
-                  when (x ? 'answer') and trim(x->>'answer') in ('نعم','لا') then (trim(x->>'answer') = 'نعم')
+                  when x ? 'answer_kind' then lower(trim(x->>'answer_kind'))
+                  when x ? 'answer' then lower(trim(x->>'answer'))
                   else null
-                end as answer_bool
+                end as answer_text
               from jsonb_array_elements(coalesce(current_history, '[]'::jsonb)) as x
+            ),
+            h_kind as (
+              select
+                hr.feature_id,
+                hr.normalized_question,
+                case
+                  when hr.answer_text in ('yes','y','true','نعم') then 'yes'::public.answer_kind
+                  when hr.answer_text in ('no','n','false','لا') then 'no'::public.answer_kind
+                  when hr.answer_text in ('maybe','ربما','جزئيا','جزئياً') then 'maybe'::public.answer_kind
+                  when hr.answer_text in ('unknown','idk','لا اعرف','لا أعرف') then 'unknown'::public.answer_kind
+                  else null
+                end as answer_kind
+              from h_raw hr
             ),
             h_resolved as (
               select
-                coalesce(hr.feature_id, mq.feature_id) as feature_id,
-                hr.answer_bool as answer_bool
-              from h_raw hr
+                coalesce(hk.feature_id, mq.feature_id) as feature_id,
+                hk.answer_kind as answer_kind,
+                hk.normalized_question as normalized_question
+              from h_kind hk
               left join lateral (
                 select m.feature_id
-                from public.match_question_metadata(hr.normalized_question, 0.88) m
+                from public.match_question_metadata(hk.normalized_question, 0.88) m
                 limit 1
-              ) mq on hr.feature_id is null and hr.normalized_question is not null
-              where hr.answer_bool is not null
+              ) mq on hk.feature_id is null and hk.normalized_question is not null
+              where coalesce(hk.feature_id, mq.feature_id) is not null and hk.answer_kind is not null
             ),
-            h as (
-              select distinct feature_id, answer_bool
+            h_for_weighting as (
+              select distinct feature_id, answer_kind
               from h_resolved
-              where feature_id is not null
+              where answer_kind <> 'unknown'
             ),
-            h_yes as (
-              select feature_id from h where answer_bool = true
+            base as (
+              select
+                c.id,
+                c.name,
+                c.normalized_name,
+                c.prior_weight::double precision as prior_w
+              from public.candidates c
+              where (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
             ),
-            h_no as (
-              select feature_id from h where answer_bool = false
-            ),
-            yes_counts as (
-              select pf.player_id, count(*) as yes_hits
-              from public.player_features pf
-              join h_yes hy on hy.feature_id = pf.feature_id
-              group by pf.player_id
+            remaining as (
+              select
+                b.id,
+                b.name,
+                (b.prior_w * exp(coalesce(sum(ln(greatest(
+                  case h.answer_kind
+                    when 'yes' then case pf.answer when 'yes' then 1::double precision when 'no' then 1e-6::double precision else 0.5::double precision end
+                    when 'no' then case pf.answer when 'yes' then 1e-6::double precision when 'no' then 1::double precision else 0.5::double precision end
+                    when 'maybe' then case pf.answer when 'yes' then 0.8::double precision when 'no' then 0.2::double precision else 0.6::double precision end
+                    else 1::double precision
+                  end
+                , 1e-9::double precision))), 0))) as w
+              from base b
+              left join h_for_weighting h on true
+              left join public.player_features pf
+                on pf.player_id = b.id and pf.feature_id = h.feature_id
+              group by b.id, b.name, b.prior_w
             )
-          select
-            c.id,
-            c.name,
-            c.prior_weight as w
-          from public.candidates c
-          left join public.player_features pf_no
-            on pf_no.player_id = c.id
-           and pf_no.feature_id in (select feature_id from h_no)
-          left join yes_counts yc on yc.player_id = c.id
-          where pf_no.player_id is null
-            and coalesce(yc.yes_hits, 0) = (select count(*) from h_yes)
-            and (rejected_guess_names is null or c.normalized_name <> all(rejected_guess_names))
-          order by c.prior_weight desc, c.name asc
+          select r.id, r.name, r.w
+          from remaining r
+          where r.w > 0
+          order by r.w desc, r.name asc
           limit 25
         ) r
       )
@@ -621,7 +798,9 @@ begin
         'confidence', top_prob
       ),
       'info_gain', best_info_gain,
-      'score', best_score
+      'score', best_score,
+      'missing_n', coalesce(best_missing_n, 0),
+      'missing_players', coalesce(best_missing_players, '[]'::jsonb)
     )
   );
 end;
@@ -645,6 +824,99 @@ as $$
   update public.questions_metadata
   set success_count = success_count + 1
   where id = p_question_id;
+$$;
+
+create or replace function public.get_next_best_move(p_session_id uuid)
+returns jsonb
+language plpgsql
+volatile
+as $$
+declare
+  current_history jsonb;
+  rejected_names text[];
+  move jsonb;
+begin
+  select gs.rejected_guess_names
+  into rejected_names
+  from public.game_sessions gs
+  where gs.id = p_session_id;
+
+  if rejected_names is null then
+    rejected_names := '{}'::text[];
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'feature_id', gm.feature_id,
+    'answer_kind', gm.answer_kind
+  ) order by gm.move_index), '[]'::jsonb)
+  into current_history
+  from public.game_moves gm
+  where gm.session_id = p_session_id and gm.feature_id is not null;
+
+  move := public.get_next_best_move(current_history, rejected_names);
+
+  if move->>'type' = 'question' and (move ? 'question_id') then
+    perform public.bump_question_seen(nullif(move->>'question_id', '')::uuid);
+  end if;
+
+  return move;
+end;
+$$;
+
+create or replace function public.game_start()
+returns jsonb
+language plpgsql
+volatile
+as $$
+declare
+  sid uuid;
+  move jsonb;
+begin
+  insert into public.game_sessions default values
+  returning id into sid;
+
+  move := public.get_next_best_move(sid);
+  return jsonb_build_object('session_id', sid) || move;
+end;
+$$;
+
+create or replace function public.game_step(
+  p_session_id uuid,
+  p_question_id uuid,
+  p_feature_id uuid,
+  p_answer public.answer_kind,
+  p_rejected_guess_names text[] default null
+)
+returns jsonb
+language plpgsql
+volatile
+as $$
+declare
+  next_index integer;
+  move jsonb;
+begin
+  select coalesce(max(move_index), 0) + 1
+  into next_index
+  from public.game_moves
+  where session_id = p_session_id;
+
+  insert into public.game_moves (session_id, move_index, question_id, feature_id, answer_kind)
+  values (p_session_id, next_index, p_question_id, p_feature_id, p_answer);
+
+  update public.game_sessions
+  set history = coalesce(history, '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+    'move_index', next_index,
+    'question_id', p_question_id,
+    'feature_id', p_feature_id,
+    'answer_kind', p_answer
+  )),
+  rejected_guess_names = coalesce(p_rejected_guess_names, rejected_guess_names),
+  question_count = next_index
+  where id = p_session_id;
+
+  move := public.get_next_best_move(p_session_id);
+  return jsonb_build_object('session_id', p_session_id) || move;
+end;
 $$;
 
 insert into public.candidates (name, normalized_name, prior_weight)
@@ -725,3 +997,63 @@ join public.features f on (
   (c.normalized_name = 'robert lewandowski' and f.normalized_key = 'position' and f.normalized_value = 'forward')
 )
 on conflict do nothing;
+
+create or replace function public.migrate_legacy_player_paths_to_sessions(p_max_rows integer default null)
+returns jsonb
+language plpgsql
+volatile
+as $$
+declare
+  r record;
+  inserted_sessions integer := 0;
+  q text;
+begin
+  if not exists (
+    select 1
+    from pg_tables
+    where schemaname = 'public' and tablename = 'player_paths'
+  ) then
+    return jsonb_build_object('ok', true, 'inserted_sessions', 0);
+  end if;
+
+  q := 'select player_id, history, created_at from public.player_paths order by created_at asc';
+  if p_max_rows is not null and p_max_rows > 0 then
+    q := q || format(' limit %s', p_max_rows);
+  end if;
+
+  for r in execute q loop
+    insert into public.game_sessions (
+      history,
+      status,
+      guessed_candidate_id,
+      guessed_name,
+      correct,
+      question_count,
+      created_at,
+      updated_at
+    )
+    values (
+      coalesce(r.history, '[]'::jsonb),
+      'won',
+      r.player_id,
+      null,
+      true,
+      case
+        when jsonb_typeof(r.history) = 'array' then jsonb_array_length(r.history)
+        else null
+      end,
+      coalesce(r.created_at, now()),
+      coalesce(r.created_at, now())
+    );
+
+    inserted_sessions := inserted_sessions + 1;
+  end loop;
+
+  return jsonb_build_object('ok', true, 'inserted_sessions', inserted_sessions);
+exception
+  when undefined_column then
+    return jsonb_build_object('ok', false, 'error', 'player_paths schema mismatch');
+  when others then
+    return jsonb_build_object('ok', false, 'error', sqlerrm);
+end;
+$$;

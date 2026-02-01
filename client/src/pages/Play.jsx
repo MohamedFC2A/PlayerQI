@@ -20,6 +20,7 @@ export default function Play() {
     const [currentQuestion, setCurrentQuestion] = useState(null);
     const [currentQuestionMeta, setCurrentQuestionMeta] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [sessionId, setSessionId] = useState(null);
     const [prediction, setPrediction] = useState(null);
     const [confirming, setConfirming] = useState(false);
     const [guessFeedback, setGuessFeedback] = useState(null);
@@ -38,10 +39,13 @@ export default function Play() {
         return map;
     }, [verification]);
 
-    const fetchNextMove = async (currentHistory, nextRejectedGuesses = rejectedGuesses) => {
+    const fetchNextMove = async (currentHistory, nextRejectedGuesses = rejectedGuesses, sid = sessionId) => {
         setLoading(true);
         try {
-            const response = await sendGameMove(currentHistory, nextRejectedGuesses);
+            const response = await sendGameMove(currentHistory, nextRejectedGuesses, sid);
+            if (response?.session_id) {
+                setSessionId(response.session_id);
+            }
             if (response.type === 'question') {
                 setCurrentQuestion(response.content);
                 setCurrentQuestionMeta({
@@ -78,6 +82,7 @@ export default function Play() {
     const startGame = async () => {
         setStarted(true);
         setRejectedGuesses([]);
+        setSessionId(null);
         await fetchNextMove([], []);
     };
 
@@ -101,6 +106,7 @@ export default function Play() {
         setHistory([]);
         setCurrentQuestion(null);
         setCurrentQuestionMeta(null);
+        setSessionId(null);
         setPrediction(null);
         setConfirming(false);
         setGuessFeedback(null);
@@ -129,7 +135,7 @@ export default function Play() {
         if (!prediction) return;
         setFinalizing(true);
         try {
-            const result = await finalizeGuessConfirmation({ history: editableHistory, guess: prediction.content });
+            const result = await finalizeGuessConfirmation({ history: editableHistory, guess: prediction.content, sessionId });
             if (result?.imageUrl && !prediction.imageUrl) {
                 setPrediction({ ...prediction, imageUrl: result.imageUrl });
             }
@@ -151,7 +157,8 @@ export default function Play() {
             const result = await sendGuessConfirmation({
                 history,
                 guess: prediction.content,
-                correct
+                correct,
+                sessionId
             });
 
             if (result?.imageUrl && !prediction.imageUrl) {

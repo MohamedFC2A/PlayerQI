@@ -13,8 +13,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 const supabase = createSupabaseClient();
-const ROOT_QUESTION_TEXT = '__ROOT__';
-let rootQuestionId = null;
 
 function normalizeArabicText(input) {
   if (!input) return '';
@@ -184,6 +182,119 @@ function getSmartFallbackQuestion(historyNormalizedQuestions) {
 
   // Last resort: return a completely random question from all options
   return randomStrategicQuestions[Math.floor(Math.random() * randomStrategicQuestions.length)];
+}
+
+const inflightFeaturePopulation = new Set();
+
+function toAnswerKind(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'yes' || v === 'y' || v === 'true' || v === 'نعم') return 'yes';
+  if (v === 'no' || v === 'n' || v === 'false' || v === 'لا') return 'no';
+  if (v === 'maybe' || v === 'ربما' || v === 'جزئيا' || v === 'جزئياً') return 'maybe';
+  if (v === 'unknown' || v === 'idk' || v === 'لا اعرف' || v === 'لا أعرف') return 'unknown';
+  return null;
+}
+
+async function populateMissingPlayerFeatures(featureId, questionText, missingPlayers) {
+  if (!openai || !supabase) return { ok: false, reason: 'not_configured' };
+  if (!featureId || !questionText) return { ok: false, reason: 'missing_inputs' };
+
+  const players = Array.isArray(missingPlayers) ? missingPlayers : [];
+  const candidates = players
+    .map(p => ({
+      candidate_id: p?.candidate_id ?? p?.candidateId ?? null,
+      name: String(p?.name ?? '').trim()
+    }))
+    .filter(p => p.candidate_id && p.name);
+
+  const batch = [];
+  for (const c of candidates) {
+    const key = `${featureId}:${c.candidate_id}`;
+    if (inflightFeaturePopulation.has(key)) continue;
+    inflightFeaturePopulation.add(key);
+    batch.push(c);
+    if (batch.length >= 10) break;
+  }
+
+  if (batch.length === 0) return { ok: true, inserted: 0 };
+
+  try {
+    const systemPrompt = `
+أنت مساعد بيانات لكرة القدم.
+مهمتك: تحديد إجابة نعم/لا/ربما/لا أعرف عن كل لاعب بالنسبة للسؤال.
+
+الوقت الحالي: ${new Date().toISOString()}
+
+قواعد:
+1) لا تخترع. إذا لم تكن واثقاً: answer = "unknown".
+2) السؤال قد يكون بصيغة عربية. اعتبره عبارة/خاصية عن اللاعب.
+3) أرجع JSON فقط.
+
+السؤال:
+${questionText}
+
+اللاعبون:
+${JSON.stringify(batch, null, 2)}
+
+صيغة الإخراج:
+{
+  "items": [
+    { "candidate_id": "uuid", "answer": "yes|no|maybe|unknown", "confidence": 0.0 }
+  ]
+}
+`;
+
+    const completion = await openai.chat.completions.create({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: 'أخرج JSON فقط.' }
+      ],
+      model: 'deepseek-chat',
+      temperature: 0.2,
+      response_format: { type: 'json_object' }
+    });
+
+    const parsed = JSON.parse(completion.choices?.[0]?.message?.content ?? '{}');
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+
+    const byId = new Map(items.map(it => [String(it?.candidate_id ?? it?.candidateId ?? ''), it]));
+    const payload = [];
+
+    for (const c of batch) {
+      const it = byId.get(String(c.candidate_id)) ?? null;
+      const answer = toAnswerKind(it?.answer);
+      const confidence = Number(it?.confidence ?? 0);
+      if (!answer) continue;
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) continue;
+      if (answer === 'unknown') continue;
+      if ((answer === 'yes' || answer === 'no') && confidence < 0.65) continue;
+      if (answer === 'maybe' && confidence < 0.6) continue;
+
+      payload.push({
+        player_id: c.candidate_id,
+        feature_id: featureId,
+        answer,
+        source: 'llm',
+        confidence
+      });
+    }
+
+    if (payload.length === 0) return { ok: true, inserted: 0 };
+
+    const { error } = await supabase
+      .from('player_features')
+      .upsert(payload, { onConflict: 'player_id,feature_id', ignoreDuplicates: true });
+
+    if (error) return { ok: false, reason: 'db_error' };
+    return { ok: true, inserted: payload.length };
+  } catch {
+    return { ok: false, reason: 'llm_error' };
+  } finally {
+    for (const c of batch) {
+      inflightFeaturePopulation.delete(`${featureId}:${c.candidate_id}`);
+    }
+  }
 }
 
 /**
@@ -571,56 +682,6 @@ async function learnCandidateFromHistory(candidateId, history) {
   return { ok: !error, inserted: unique.length };
 }
 
-async function bumpTransitionSuccess(fromQuestionId, answerText, nextType, nextQuestionId, nextContentText, playerId) {
-  if (!supabase) return;
-
-  const base = supabase
-    .from('question_transitions')
-    .select('id, success_count, seen_count, player_id')
-    .eq('from_question_id', fromQuestionId)
-    .eq('answer_text', answerText)
-    .eq('next_type', nextType);
-
-  const { data: existing, error } = await (async () => {
-    if (nextType === 'question') {
-      return base
-        .eq('next_question_id', nextQuestionId)
-        .is('next_content_text', null)
-        .limit(1);
-    }
-    return base
-      .is('next_question_id', null)
-      .eq('next_content_text', nextContentText)
-      .limit(1);
-  })();
-
-  if (!error && existing?.[0]?.id) {
-    const row = existing[0];
-    await supabase
-      .from('question_transitions')
-      .update({
-        success_count: (row.success_count ?? 0) + 1,
-        seen_count: (row.seen_count ?? 0) + 1,
-        player_id: playerId ?? row.player_id ?? null
-      })
-      .eq('id', row.id);
-    return;
-  }
-
-  await supabase
-    .from('question_transitions')
-    .insert({
-      from_question_id: fromQuestionId,
-      answer_text: answerText,
-      next_type: nextType,
-      next_question_id: nextQuestionId ?? null,
-      next_content_text: nextContentText ?? null,
-      player_id: playerId ?? null,
-      seen_count: 1,
-      success_count: 1
-    });
-}
-
 async function verifyHistoryWithAiAndSerper(history, playerName) {
   const evidence = await searchPlayerEvidence(playerName);
   const historyPayload = (history ?? []).map((h, i) => ({
@@ -737,40 +798,6 @@ ${JSON.stringify(historyPayload, null, 2)}
   }
 }
 
-async function storeConfirmedPlayerRun(history, guess) {
-  const player = await ensurePlayerProfile(guess);
-  if (!player?.id) {
-    return { ok: true, stored: true, playerId: null, imageUrl: null };
-  }
-
-  await supabase
-    .from('player_paths')
-    .insert({
-      player_id: player.id,
-      history
-    });
-
-  for (let i = 0; i < history.length; i += 1) {
-    const fromText = history[i]?.question;
-    const answerText = history[i]?.answer;
-    if (!fromText || !answerText) continue;
-    const fromId = await getOrCreateQuestionId(fromText);
-    if (!fromId) continue;
-
-    if (i < history.length - 1) {
-      const nextText = history[i + 1]?.question;
-      if (!nextText) continue;
-      const nextId = await getOrCreateQuestionId(nextText);
-      if (!nextId) continue;
-      await bumpTransitionSuccess(fromId, answerText, 'question', nextId, null, player.id);
-    } else {
-      await bumpTransitionSuccess(fromId, answerText, 'guess', null, guess, player.id);
-    }
-  }
-
-  return { ok: true, stored: true, playerId: player.id, imageUrl: player.image_url ?? null };
-}
-
 /**
  * Build a context query based on current game history
  */
@@ -800,359 +827,49 @@ function buildSearchQuery(history) {
   return `أشهر لاعبي كرة القدم ${yyyy}`;
 }
 
-async function getRootQuestionId() {
-  if (!supabase) return null;
-  if (rootQuestionId) return rootQuestionId;
-  const id = await getOrCreateQuestionId(ROOT_QUESTION_TEXT);
-  rootQuestionId = id;
-  return id;
-}
-
-async function getOrCreateQuestionId(text) {
-  if (!supabase) return null;
-  const normalizedText = normalizeArabicText(text);
-  if (!normalizedText) return null;
-
-  try {
-    const { data: exactRow } = await supabase
-      .from('question_nodes')
-      .select('id')
-      .eq('normalized_text', normalizedText)
-      .maybeSingle();
-
-    if (exactRow?.id) return exactRow.id;
-
-    const { data: matched } = await supabase.rpc('match_question_node', {
-      query_text: normalizedText,
-      similarity_threshold: 0.88
-    });
-
-    if (matched?.[0]?.id) return matched[0].id;
-
-    const { data, error } = await supabase
-      .from('question_nodes')
-      .upsert({ text, normalized_text: normalizedText }, { onConflict: 'normalized_text' })
-      .select('id')
-      .single();
-
-    if (error) return null;
-    return data?.id ?? null;
-  } catch {
-    const { data, error } = await supabase
-      .from('question_nodes')
-      .upsert({ text }, { onConflict: 'text' })
-      .select('id')
-      .single();
-
-    if (error) return null;
-    return data?.id ?? null;
-  }
-}
-
-function computeTransitionScore(transition) {
-  const seen = transition?.seen_count ?? 0;
-  const success = transition?.success_count ?? 0;
-  const rate = (success + 1) / (seen + 2);
-  const volume = Math.min(1, Math.log(seen + 1) / 4);
-  return rate * 0.85 + volume * 0.15;
-}
-
-async function getBestTransition(fromQuestionId, answerText, historyNormalizedQuestions, rejectedGuessSet) {
-  if (!supabase) return null;
-  const { data, error } = await supabase
-    .from('question_transitions')
-    .select('id, next_type, next_question_id, next_content_text, success_count, seen_count, updated_at')
-    .eq('from_question_id', fromQuestionId)
-    .eq('answer_text', answerText)
-    .order('seen_count', { ascending: false })
-    .order('success_count', { ascending: false })
-    .order('updated_at', { ascending: false })
-    .limit(50);
-
-  if (error) return null;
-  const transitions = (data ?? []).slice().sort((a, b) => {
-    const sa = computeTransitionScore(a);
-    const sb = computeTransitionScore(b);
-    if (sb !== sa) return sb - sa;
-    const va = (a?.seen_count ?? 0) - (b?.seen_count ?? 0);
-    if (va !== 0) return -va;
-    const ua = new Date(a?.updated_at ?? 0).getTime();
-    const ub = new Date(b?.updated_at ?? 0).getTime();
-    return ub - ua;
-  });
-
-  const questionIds = transitions
-    .filter(t => t.next_type === 'question' && t.next_question_id)
-    .map(t => t.next_question_id);
-
-  const questionMap = new Map();
-  if (questionIds.length > 0) {
-    let questions = [];
-    try {
-      const { data } = await supabase
-        .from('question_nodes')
-        .select('id, text, normalized_text')
-        .in('id', questionIds);
-      questions = data ?? [];
-    } catch {
-      const { data } = await supabase
-        .from('question_nodes')
-        .select('id, text')
-        .in('id', questionIds);
-      questions = data ?? [];
-    }
-
-    for (const q of questions ?? []) {
-      questionMap.set(q.id, q);
-    }
-  }
-
-  for (const t of transitions) {
-    if (t.next_type === 'guess') {
-      const content = t.next_content_text;
-      if (!content) continue;
-      const normalized = normalizeArabicText(content);
-      if (normalized && rejectedGuessSet?.has(normalized)) continue;
-      return { transition: t, resolved: { type: 'guess', content: t.next_content_text } };
-    }
-    const q = questionMap.get(t.next_question_id);
-    if (!q?.text) continue;
-    if (isTooSimilarQuestion(q.text, historyNormalizedQuestions)) continue;
-    return { transition: t, resolved: { type: 'question', content: q.text } };
-  }
-
-  return null;
-}
-
-async function getFallbackQuestionFromPlayerPaths(lastQuestionNormalized, answerText, historyNormalizedQuestions) {
-  if (!supabase || !lastQuestionNormalized || !answerText) return null;
-  const { data, error } = await supabase
-    .from('player_paths')
-    .select('history, created_at')
-    .order('created_at', { ascending: false })
-    .limit(250);
-
-  if (error) return null;
-
-  const counts = new Map();
-  const latestAt = new Map();
-
-  for (const row of data ?? []) {
-    const path = Array.isArray(row?.history) ? row.history : [];
-    for (let i = 0; i < path.length - 1; i += 1) {
-      const q = normalizeArabicText(path[i]?.question ?? '');
-      const a = path[i]?.answer ?? '';
-      if (!q || q !== lastQuestionNormalized) continue;
-      if (a !== answerText) continue;
-
-      const nextQ = path[i + 1]?.question ?? '';
-      if (!nextQ) continue;
-      const nextNorm = normalizeArabicText(nextQ);
-      if (!nextNorm) continue;
-      if (isTooSimilarQuestion(nextQ, historyNormalizedQuestions)) continue;
-
-      const key = nextNorm;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-      const t = new Date(row?.created_at ?? 0).getTime();
-      if (!latestAt.has(key) || t > latestAt.get(key)) latestAt.set(key, t);
-    }
-  }
-
-  let best = null;
-  for (const [key, count] of counts.entries()) {
-    const recency = latestAt.get(key) ?? 0;
-    const score = count * 10 + recency / 1_000_000_000;
-    if (!best || score > best.score) best = { key, score };
-  }
-
-  if (!best) return null;
-
-  for (const row of data ?? []) {
-    const path = Array.isArray(row?.history) ? row.history : [];
-    for (let i = 0; i < path.length - 1; i += 1) {
-      const nextQ = path[i + 1]?.question ?? '';
-      if (!nextQ) continue;
-      const nextNorm = normalizeArabicText(nextQ);
-      if (nextNorm === best.key) return nextQ;
-    }
-  }
-
-  return null;
-}
-
-async function inferPlayerGuessFromPaths(history, rejectedGuessSet) {
-  if (!supabase) return null;
-  const historyItems = Array.isArray(history) ? history : [];
-  if (historyItems.length < 5) return null;
-
-  const historyPairs = historyItems
-    .map(h => ({
-      q: normalizeArabicText(h?.question ?? ''),
-      a: h?.answer ?? ''
-    }))
-    .filter(x => x.q && x.a);
-
-  if (historyPairs.length < 5) return null;
-
-  const { data, error } = await supabase
-    .from('player_paths')
-    .select('history, players(name, image_url)')
-    .order('created_at', { ascending: false })
-    .limit(400);
-
-  if (error || !Array.isArray(data) || data.length === 0) return null;
-
-  const agg = new Map();
-
-  for (const row of data) {
-    const playerName = row?.players?.name;
-    if (!playerName) continue;
-    const normalizedName = normalizeArabicText(playerName);
-    if (normalizedName && rejectedGuessSet?.has(normalizedName)) continue;
-
-    const path = Array.isArray(row?.history) ? row.history : [];
-    if (path.length === 0) continue;
-
-    const pathSet = new Set(
-      path
-        .map(it => `${normalizeArabicText(it?.question ?? '')}::${it?.answer ?? ''}`)
-        .filter(Boolean)
-    );
-
-    let matched = 0;
-    for (const hp of historyPairs) {
-      if (pathSet.has(`${hp.q}::${hp.a}`)) matched += 1;
-    }
-
-    const ratio = matched / historyPairs.length;
-    if (ratio < 0.55) continue;
-
-    const prev = agg.get(playerName) ?? {
-      name: playerName,
-      imageUrl: row?.players?.image_url ?? null,
-      scoreSum: 0,
-      samples: 0,
-      bestRatio: 0
-    };
-
-    prev.scoreSum += ratio;
-    prev.samples += 1;
-    if (ratio > prev.bestRatio) prev.bestRatio = ratio;
-    if (!prev.imageUrl && row?.players?.image_url) prev.imageUrl = row.players.image_url;
-    agg.set(playerName, prev);
-  }
-
-  const candidates = Array.from(agg.values())
-    .filter(c => c.samples >= 2 || c.bestRatio >= 0.8)
-    .sort((a, b) => {
-      const sa = (a.scoreSum / a.samples) * 0.7 + a.bestRatio * 0.3 + Math.min(1, a.samples / 5) * 0.2;
-      const sb = (b.scoreSum / b.samples) * 0.7 + b.bestRatio * 0.3 + Math.min(1, b.samples / 5) * 0.2;
-      return sb - sa;
-    });
-
-  if (candidates.length === 0) return null;
-
-  const best = candidates[0];
-  const bestScore = (best.scoreSum / best.samples) * 0.7 + best.bestRatio * 0.3 + Math.min(1, best.samples / 5) * 0.2;
-  const second = candidates[1];
-  const secondScore = second
-    ? (second.scoreSum / second.samples) * 0.7 + second.bestRatio * 0.3 + Math.min(1, second.samples / 5) * 0.2
-    : 0;
-
-  const lead = bestScore - secondScore;
-  const confidence = Math.max(0, Math.min(0.99, (bestScore + lead) / 1.6));
-
-  if (confidence < 0.78) return null;
-
-  return {
-    type: 'guess',
-    content: best.name,
-    imageUrl: best.imageUrl ?? null,
-    confidence,
-    samples: best.samples,
-    bestRatio: best.bestRatio
-  };
-}
-
-async function bumpTransitionSeen(transitionId) {
-  if (!supabase) return;
-  const { data } = await supabase
-    .from('question_transitions')
-    .select('seen_count')
-    .eq('id', transitionId)
-    .single();
-
-  const seen = data?.seen_count ?? 0;
-  await supabase
-    .from('question_transitions')
-    .update({ seen_count: seen + 1 })
-    .eq('id', transitionId);
-}
-
-async function storeTransition(fromQuestionId, answerText, nextType, nextQuestionId, nextContentText) {
-  if (!supabase) return;
-
-  const baseQuery = supabase
-    .from('question_transitions')
-    .select('id, seen_count')
-    .eq('from_question_id', fromQuestionId)
-    .eq('answer_text', answerText)
-    .eq('next_type', nextType);
-
-  const { data: existing, error: existingError } = await (async () => {
-    if (nextType === 'question') {
-      return baseQuery
-        .eq('next_question_id', nextQuestionId)
-        .is('next_content_text', null)
-        .limit(1);
-    }
-    return baseQuery
-      .is('next_question_id', null)
-      .eq('next_content_text', nextContentText)
-      .limit(1);
-  })();
-
-  if (!existingError && existing?.[0]?.id) {
-    const id = existing[0].id;
-    const seen = existing[0].seen_count ?? 0;
-    await supabase
-      .from('question_transitions')
-      .update({ seen_count: seen + 1 })
-      .eq('id', id);
-    return;
-  }
-
-  await supabase
-    .from('question_transitions')
-    .insert({
-      from_question_id: fromQuestionId,
-      answer_text: answerText,
-      next_type: nextType,
-      next_question_id: nextQuestionId ?? null,
-      next_content_text: nextContentText ?? null,
-      seen_count: 1,
-    });
-}
-
 app.post('/api/game', async (req, res) => {
   try {
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
     const rejectedGuesses = Array.isArray(req.body?.rejectedGuesses) ? req.body.rejectedGuesses : [];
     const historyNormalizedQuestions = history.map(h => normalizeArabicText(h?.question)).filter(Boolean);
     const rejectedGuessNames = rejectedGuesses.map(g => normalizeArabicText(g)).filter(Boolean);
+    const sessionId = String(req.body?.session_id ?? req.body?.sessionId ?? '').trim() || null;
 
     if (supabase) {
-      const currentHistory = history.map(h => ({
-        feature_id: h?.feature_id ?? h?.featureId ?? null,
-        normalized_question: h?.normalized_question ?? normalizeArabicText(h?.question ?? ''),
-        answer: h?.answer ?? null,
-        answer_bool: parseYesNoToBool(h?.answer)
-      }));
+      let move = null;
+      let error = null;
 
-      const { data: move, error } = await supabase.rpc('get_next_best_move', {
-        current_history: currentHistory,
-        rejected_guess_names: rejectedGuessNames
-      });
+      if (history.length === 0) {
+        const result = await supabase.rpc('game_start');
+        move = result?.data ?? null;
+        error = result?.error ?? null;
+      } else if (sessionId) {
+        const last = history[history.length - 1] ?? null;
+        const lastAnswerKind = toAnswerKind(last?.answer) ?? 'unknown';
+        const result = await supabase.rpc('game_step', {
+          p_session_id: sessionId,
+          p_question_id: last?.question_id ?? last?.questionId ?? null,
+          p_feature_id: last?.feature_id ?? last?.featureId ?? null,
+          p_answer: lastAnswerKind,
+          p_rejected_guess_names: rejectedGuessNames
+        });
+        move = result?.data ?? null;
+        error = result?.error ?? null;
+      } else {
+        const currentHistory = history.map(h => ({
+          feature_id: h?.feature_id ?? h?.featureId ?? null,
+          normalized_question: h?.normalized_question ?? normalizeArabicText(h?.question ?? ''),
+          answer: h?.answer ?? null,
+          answer_bool: parseYesNoToBool(h?.answer)
+        }));
+
+        const result = await supabase.rpc('get_next_best_move', {
+          current_history: currentHistory,
+          rejected_guess_names: rejectedGuessNames
+        });
+        move = result?.data ?? null;
+        error = result?.error ?? null;
+      }
 
       if (!error && move?.type === 'guess' && move?.content) {
         const imageUrl = await getGuessImageUrl(move.content);
@@ -1161,316 +878,53 @@ app.post('/api/game', async (req, res) => {
           content: move.content,
           confidence: move.confidence ?? null,
           meta: move.meta ?? null,
-          imageUrl
+          imageUrl,
+          session_id: move.session_id ?? sessionId ?? null
         });
       }
 
       if (!error && move?.type === 'question' && move?.content) {
-        await bumpQuestionSeen(move.question_id ?? null);
+        const featureId = move.feature_id ?? null;
+        const missingPlayers = move?.meta?.missing_players ?? null;
+        if (openai && featureId && Array.isArray(missingPlayers) && missingPlayers.length > 0) {
+          Promise.resolve()
+            .then(() => populateMissingPlayerFeatures(featureId, move.content, missingPlayers))
+            .catch(() => null);
+        }
         return res.json({
           type: 'question',
           content: move.content,
           question_id: move.question_id ?? null,
           feature_id: move.feature_id ?? null,
-          meta: move.meta ?? null
+          meta: move.meta ?? null,
+          session_id: move.session_id ?? sessionId ?? null
         });
       }
 
       if (!error && move?.type === 'gap') {
-        const candidateSample = Array.isArray(move?.candidates_sample) ? move.candidates_sample : [];
-        const candidateNames = candidateSample.map(c => c?.name).filter(Boolean);
-
-        if (!openai) {
-          return res.json({
-            type: 'question',
-            content: getSmartFallbackQuestion(historyNormalizedQuestions)
-          });
-        }
-
-        const systemPrompt = `
-🧠 أنت خبير استراتيجي في لعبة تخمين لاعبي كرة القدم - مهمتك: تخمين اللاعب في ≤10 أسئلة.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 STANDARD CONTEXT (افترض هذا دائماً بدون سؤال):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ اللاعب = لاعب كرة قدم محترف ذكر (male professional footballer)
-✅ لا تسأل: "هل هو ذكر؟" أو "هل هو لاعب كرة قدم؟" - هذا مفترض مسبقاً!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ BANNED QUESTIONS (ممنوع نهائياً):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-❌ "هل هو ذكر؟" / "هل هي أنثى؟"
-❌ "هل هو لاعب كرة قدم؟"
-❌ "هل هو مشهور؟"
-❌ "هل هو موجود في قاعدة البيانات؟"
-❌ "هل اسمه يبدأ بحرف [X]؟"
-❌ "هل عمره أقل/أكثر من [رقم عشوائي]؟"
-❌ أي سؤال يعطي معلومات قليلة جداً (entropy منخفضة)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 STRATEGIC RULES (قواعد الإستراتيجية):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1️⃣ **Binary Search Approach**: كل سؤال يجب أن يقسم المرشحين إلى ~50/50 (أو على الأقل 30/70)
-2️⃣ **High Entropy**: اسأل عن معلومات تؤدي لأكبر تضييق ممكن
-3️⃣ **Strategic Order**: 
-   - السؤال 1-3: اسأل عن continent/region (أفريقيا، أوروبا، أمريكا الجنوبية)
-   - السؤال 4-6: اسأل عن club tier (top 5 leagues) أو retired status
-   - السؤال 7-9: اسأل عن position، awards، national team
-   - السؤال 10+: تفاصيل دقيقة (foot, specific clubs, specific awards)
-
-4️⃣ **Split Ratio**: positive_players يجب أن تكون بين 15%-85% من إجمالي المرشحين
-5️⃣ **No Repetition**: لا تسأل أسئلة قريبة بالمعنى من الأسئلة السابقة
-6️⃣ **Smart Features**: استخدم feature.key من القائمة الرسمية فقط
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 ALLOWED FEATURE KEYS ONLY:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ position (مهاجم، مدافع، حارس مرمى، وسط)
-✅ nationality (الجنسية الفعلية)
-✅ continent (أفريقيا، أوروبا، أمريكا الجنوبية، آسيا)
-✅ retired (معتزل أو لا)
-✅ foot (اليد اليمنى/اليسرى)
-✅ height_bucket (طويل/قصير/متوسط)
-✅ age_bucket (شاب/متوسط/كبير)
-✅ club (النادي الحالي أو الأخير)
-✅ national_team (المنتخب الوطني)
-✅ award (جوائز كبرى: كأس العالم، دوري الأبطال، بالون دور، الحذاء الذهبي)
-
-⛔ BANNED: league, دوري، أسماء دوريات كميزات منفصلة
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎲 INPUT DATA:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-المرشحون الباقون (${candidateNames.length} لاعب):
-${JSON.stringify(candidateNames.slice(0, 50), null, 2)}
-${candidateNames.length > 50 ? `... و ${candidateNames.length - 50} لاعب آخر` : ''}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📜 CONVERSATION HISTORY (${history.length} سؤال + إجابة):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${history.length === 0 ? '(لا توجد أسئلة سابقة - هذا السؤال الأول)' :
-            history.map((h, idx) => `${idx + 1}. سؤال: "${h?.question ?? ''}"
-   ↳ إجابة: ${h?.answer ?? '؟'}`).join('\n')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧩 CONTEXT ANALYSIS (ما تعلمناه حتى الآن):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${history.length === 0 ? '- لا توجد معلومات بعد\n- ابدأ بسؤال استراتيجي عن القارة أو المنطقة' :
-            `الحقائق المؤكدة (نعم):
-${history.filter(h => h?.answer === 'نعم').map(h => `  ✅ ${h?.question}`).join('\n') || '  (لا توجد)'}
-
-الحقائق المنفية (لا):
-${history.filter(h => h?.answer === 'لا').map(h => `  ❌ ${h?.question}`).join('\n') || '  (لا توجد)'}
-
-⚠️ CRITICAL: السؤال التالي يجب أن:
-1. يبني على المعلومات أعلاه منطقياً
-2. لا يكرر أي سؤال سابق
-3. يضيف معلومة جديدة تماماً
-4. يضيق نطاق المرشحين بكفاءة`}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📤 OUTPUT FORMAT (JSON ONLY):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{
-  "type": "question",
-  "content": "السؤال بالعربية (≤10 كلمات، نعم/لا فقط)",
-  "feature": {
-    "key": "position|nationality|continent|retired|foot|height_bucket|age_bucket|club|national_team|award",
-    "value": "القيمة المحددة"
-  },
-  "positive_players": ["أسماء اللاعبين من القائمة فقط"],
-  "confidence": 0.85,
-  "reasoning": "لماذا هذا السؤال منطقي الآن؟ (سطر واحد)"
-}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ CRITICAL REMINDER:
-- راجع كل الإجابات السابقة قبل السؤال
-- لا تكرر معلومات عرفتها بالفعل
-- اسأل سؤال يبني على السياق الحالي
-- كل سؤال يجب أن يكون خطوة منطقية للوصول للحل
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-`;
-
-        const completion = await openai.chat.completions.create({
-          messages: [
-            { role: "system", content: systemPrompt },
-            {
-              role: "user", content: history.length === 0
-                ? "أخرج السؤال الأول الآن (ابدأ بسؤال عن القارة أو المنطقة)."
-                : `راجع كل الإجابات السابقة بعناية. ما هو السؤال المنطقي التالي الذي يبني على السياق الموجود خطوة بخطوة؟ تذكر: لا قفزات عشوائية! كل سؤال يجب أن يكون النتيجة المنطقية للأسئلة السابقة.`
-            }
-          ],
-          model: "deepseek-chat",
-          temperature: 0.7,
-          response_format: { type: "json_object" }
-        });
-
-        const ai = JSON.parse(completion.choices[0].message.content);
-
-        // Log AI reasoning for debugging
-        if (ai?.reasoning) {
-          console.log(`🤔 AI Reasoning: "${ai.reasoning}"`);
-        }
-
-        if (ai?.type === 'guess' && ai?.content) {
-          const imageUrl = await getGuessImageUrl(ai.content);
-          return res.json({ type: 'guess', content: ai.content, imageUrl });
-        }
-
-        const content = String(ai?.content ?? '').trim();
-        const featureKey = String(ai?.feature?.key ?? '').trim();
-        const featureValue = String(ai?.feature?.value ?? '').trim();
-        const positivePlayers = Array.isArray(ai?.positive_players) ? ai.positive_players : [];
-        const featureKeyNorm = normalizeArabicText(featureKey);
-        const featureValueNorm = normalizeArabicText(featureValue);
-        const contentNorm = normalizeArabicText(content);
-        const isLeagueLike = featureKeyNorm === 'league' || contentNorm.includes('دوري') || featureValueNorm.includes('دوري');
-        const allowedFeatureKeys = new Set([
-          'position',
-          'nationality',
-          'continent',
-          'retired',
-          'foot',
-          'height_bucket',
-          'age_bucket',
-          'club',
-          'national_team',
-          'award'
-        ]);
-        const candidateCount = candidateNames.length;
-        const positiveCount = positivePlayers.length;
-        const splitRatio = candidateCount > 0 ? positiveCount / candidateCount : 0;
-        const isBadSplit = candidateCount >= 8 && (splitRatio < 0.15 || splitRatio > 0.85);
-        const isBadKey = featureKeyNorm && !allowedFeatureKeys.has(featureKeyNorm);
-        const isBanned = isBannedQuestion(content);
-
-        if (!content || !featureKey || !featureValue || isLeagueLike || isBadKey || isBadSplit || isBanned || isTooSimilarQuestion(content, historyNormalizedQuestions)) {
-          if (isBanned) {
-            console.log(`⛔ BLOCKED BANNED QUESTION: "${content}"`);
-          }
-          if (isBadSplit) {
-            console.log(`⚠️ BLOCKED BAD SPLIT: "${content}" (${positiveCount}/${candidateCount} = ${(splitRatio * 100).toFixed(1)}%)`);
-          }
-          return res.json({
-            type: 'question',
-            content: getSmartFallbackQuestion(historyNormalizedQuestions)
-          });
-        }
-
-        const feature = await upsertFeature(featureKey, featureValue);
-        if (!feature?.id) {
-          return res.json({ type: 'question', content });
-        }
-
-        const q = await upsertQuestionMetadata(feature.id, content);
-        const candidatesMap = await upsertCandidatesByNames(positivePlayers);
-        const candidateIds = Array.from(candidatesMap.values()).map(r => r.id);
-        await upsertPlayerFeatures(feature.id, candidateIds, 'llm', Number.isFinite(Number(ai?.confidence)) ? Number(ai.confidence) : null);
-        await bumpQuestionSeen(q?.id ?? null);
-
         return res.json({
           type: 'question',
-          content: q?.question_text ?? content,
-          question_id: q?.id ?? null,
-          feature_id: q?.feature_id ?? feature.id
+          content: getSmartFallbackQuestion(historyNormalizedQuestions),
+          meta: move?.meta ?? null,
+          session_id: move.session_id ?? sessionId ?? null
         });
       }
     }
 
-    if (!openai) {
-      return res.json({
-        type: 'question',
-        content: getSmartFallbackQuestion(historyNormalizedQuestions)
-      });
-    }
-
-    const fallbackPrompt = `
-🧠 أنت خبير استراتيجي في لعبة تخمين لاعبي كرة القدم - مهمتك: تخمين اللاعب في ≤10 أسئلة.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 STANDARD CONTEXT (مفترض مسبقاً):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ اللاعب = لاعب كرة قدم محترف ذكر
-✅ ممنوع السؤال عن: الجنس، "هل هو لاعب كرة قدم"، "هل هو مشهور"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ BANNED QUESTIONS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-❌ "هل هو ذكر؟"
-❌ "هل هو لاعب كرة قدم؟"
-❌ "هل هو مشهور؟"
-❌ "هل اسمه يبدأ بحرف...؟"
-❌ أسئلة عن العمر بأرقام محددة
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 STRATEGIC APPROACH:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- السؤال 1-3: continent/region
-- السؤال 4-6: retired status, club tier
-- السؤال 7-9: position, awards, national team
-- السؤال 10+: تفاصيل دقيقة
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📜 CONVERSATION HISTORY (${history.length} سؤال + إجابة):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${history.length === 0 ? '(لا توجد أسئلة سابقة - هذا السؤال الأول)' :
-        history.map((h, idx) => `${idx + 1}. "${h?.question ?? ''}" → ${h?.answer ?? '؟'}`).join('\n')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧩 CONTEXT ANALYSIS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${history.length === 0 ? '- ابدأ بسؤال عن القارة أو المنطقة' :
-        `✅ نعم: ${history.filter(h => h?.answer === 'نعم').map(h => h?.question).join(', ') || '(لا توجد)'}
-❌ لا: ${history.filter(h => h?.answer === 'لا').map(h => h?.question).join(', ') || '(لا توجد)'}
-
-⚠️ السؤال التالي يجب أن يبني على هذه المعلومات منطقياً!`}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT (JSON ONLY):
-{ "type": "question", "content": "السؤال بالعربية" }
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-`;
-
-    const completion = await openai.chat.completions.create({
-      messages: [
-        { role: "system", content: fallbackPrompt },
-        {
-          role: "user", content: history.length === 0
-            ? "أخرج السؤال الأول (ابدأ بالقارة)."
-            : "بناءً على الإجابات السابقة، ما السؤال المنطقي التالي؟"
-        }
-      ],
-      model: "deepseek-chat",
-      temperature: 0.3, // Lower temperature for more strategic/consistent questions
-      response_format: { type: "json_object" }
-    });
-
-    const aiResponse = JSON.parse(completion.choices[0].message.content);
-    const fallbackContent = String(aiResponse?.content ?? getSmartFallbackQuestion(historyNormalizedQuestions));
-
-    // Validate fallback question - if banned, use safe default
-    if (isBannedQuestion(fallbackContent) || isTooSimilarQuestion(fallbackContent, historyNormalizedQuestions)) {
-      return res.json({
-        type: 'question',
-        content: getSmartFallbackQuestion(historyNormalizedQuestions) // Smart strategic fallback
-      });
-    }
-
     return res.json({
       type: 'question',
-      content: fallbackContent
+      content: getSmartFallbackQuestion(historyNormalizedQuestions)
     });
-
   } catch (error) {
-    console.error('Error calling DeepSeek API:', error);
-    res.status(500).json({ error: 'حدث خطأ في الاتصال بالذكاء الاصطناعي' });
+    console.error('Error in game endpoint:', error);
+    res.status(500).json({ error: 'حدث خطأ في لعبة التخمين' });
   }
 });
 
 app.post('/api/confirm', async (req, res) => {
   try {
     const { history, guess, correct } = req.body ?? {};
+    const sessionId = String(req.body?.session_id ?? req.body?.sessionId ?? '').trim() || null;
     if (!Array.isArray(history) || typeof guess !== 'string' || typeof correct !== 'boolean') {
       return res.status(400).json({ error: 'bad_request' });
     }
@@ -1480,8 +934,7 @@ app.post('/api/confirm', async (req, res) => {
     }
 
     if (!correct) {
-      const sessionId = await recordGameSession({ history, guess, correct, candidateId: null });
-      return res.json({ ok: true, stored: true, correct: false });
+      return res.json({ ok: true, stored: false, correct: false, sessionId: sessionId ?? null });
     }
 
     const imageUrl = await getGuessImageUrl(guess);
@@ -1489,8 +942,25 @@ app.post('/api/confirm', async (req, res) => {
 
     if (verification?.ok && Array.isArray(verification.issues) && verification.issues.length === 0) {
       const candidate = await ensurePlayerProfile(guess);
-      const sessionId = await recordGameSession({ history, guess, correct: true, candidateId: candidate?.id ?? null });
-      if (sessionId) await recordGameMoves(sessionId, history);
+      let storedSessionId = null;
+      if (sessionId) {
+        const { error } = await supabase
+          .from('game_sessions')
+          .update({
+            status: 'won',
+            guessed_candidate_id: candidate?.id ?? null,
+            guessed_name: guess,
+            correct: true,
+            question_count: Array.isArray(history) ? history.length : null
+          })
+          .eq('id', sessionId);
+        storedSessionId = error ? null : sessionId;
+      }
+
+      if (!storedSessionId) {
+        storedSessionId = await recordGameSession({ history, guess, correct: true, candidateId: candidate?.id ?? null });
+        if (storedSessionId) await recordGameMoves(storedSessionId, history);
+      }
       if (candidate?.id) await learnCandidateFromHistory(candidate.id, history);
       const questionIds = Array.from(new Set(history.map(h => h?.question_id ?? h?.questionId ?? null).filter(Boolean)));
       for (const qid of questionIds) {
@@ -1500,7 +970,7 @@ app.post('/api/confirm', async (req, res) => {
         ok: true,
         correct: true,
         stored: true,
-        sessionId,
+        sessionId: storedSessionId,
         reviewRequired: false,
         verification,
         imageUrl: candidate?.image_url ?? imageUrl ?? null
@@ -1523,6 +993,7 @@ app.post('/api/confirm', async (req, res) => {
 app.post('/api/confirm-final', async (req, res) => {
   try {
     const { history, guess } = req.body ?? {};
+    const sessionId = String(req.body?.session_id ?? req.body?.sessionId ?? '').trim() || null;
     if (!Array.isArray(history) || typeof guess !== 'string') {
       return res.status(400).json({ error: 'bad_request' });
     }
@@ -1532,14 +1003,31 @@ app.post('/api/confirm-final', async (req, res) => {
     }
 
     const candidate = await ensurePlayerProfile(guess);
-    const sessionId = await recordGameSession({ history, guess, correct: true, candidateId: candidate?.id ?? null });
-    if (sessionId) await recordGameMoves(sessionId, history);
+    let storedSessionId = null;
+    if (sessionId) {
+      const { error } = await supabase
+        .from('game_sessions')
+        .update({
+          status: 'won',
+          guessed_candidate_id: candidate?.id ?? null,
+          guessed_name: guess,
+          correct: true,
+          question_count: Array.isArray(history) ? history.length : null
+        })
+        .eq('id', sessionId);
+      storedSessionId = error ? null : sessionId;
+    }
+
+    if (!storedSessionId) {
+      storedSessionId = await recordGameSession({ history, guess, correct: true, candidateId: candidate?.id ?? null });
+      if (storedSessionId) await recordGameMoves(storedSessionId, history);
+    }
     if (candidate?.id) await learnCandidateFromHistory(candidate.id, history);
     const questionIds = Array.from(new Set(history.map(h => h?.question_id ?? h?.questionId ?? null).filter(Boolean)));
     for (const qid of questionIds) {
       await bumpQuestionSuccess(qid);
     }
-    return res.json({ ok: true, stored: true, playerId: candidate?.id ?? null, imageUrl: candidate?.image_url ?? null, sessionId });
+    return res.json({ ok: true, stored: true, playerId: candidate?.id ?? null, imageUrl: candidate?.image_url ?? null, sessionId: storedSessionId });
   } catch {
     return res.status(500).json({ error: 'server_error' });
   }
