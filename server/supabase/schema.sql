@@ -488,7 +488,7 @@ begin
     best_score
   from best b;
 
-  if best_feature_id is null or best_question_id is null or best_question_text is null or best_info_gain is null or best_info_gain <= 0.0005 then
+  if best_feature_id is null or best_question_id is null or best_question_text is null or best_info_gain is null or best_info_gain <= 0.0005 or best_score is null or best_score <= 0.003 then
     return jsonb_build_object(
       'type', 'gap',
       'reason', 'no_good_question',

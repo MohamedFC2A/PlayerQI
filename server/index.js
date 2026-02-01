@@ -1087,7 +1087,7 @@ app.post('/api/game', async (req, res) => {
         if (!openai) {
           return res.json({
             type: 'question',
-            content: 'هل يلعب في أوروبا؟'
+            content: 'هل يلعب كمهاجم؟'
           });
         }
 
@@ -1101,6 +1101,10 @@ app.post('/api/game', async (req, res) => {
 3) feature.key و feature.value يجب أن تكون نصوص قصيرة (بالإنجليزية أو العربية).
 4) positive_players يجب أن تكون أسماء من المرشحين فقط (لا تخترع أسماء).
 5) لا تعيد سؤال قريب من الأسئلة السابقة.
+6) feature.key يجب أن يكون واحداً من:
+   position, nationality, continent, retired, foot, height_bucket, age_bucket, club, national_team, award
+7) ممنوع توليد أسئلة/ميزات عن "league" أو "دوري" أو أسماء دوريات/بلدان كميزات منفصلة.
+8) اختر ميزة تقسم المرشحين بشكل متوازن قدر الإمكان (لا تجعل positive_players صغيرة جداً).
 
 المرشحون (اختار منهم فقط):
 ${JSON.stringify(candidateNames, null, 2)}
@@ -1138,11 +1142,15 @@ ${JSON.stringify(history.map(h => h?.question ?? ''), null, 2)}
         const featureKey = String(ai?.feature?.key ?? '').trim();
         const featureValue = String(ai?.feature?.value ?? '').trim();
         const positivePlayers = Array.isArray(ai?.positive_players) ? ai.positive_players : [];
+        const featureKeyNorm = normalizeArabicText(featureKey);
+        const featureValueNorm = normalizeArabicText(featureValue);
+        const contentNorm = normalizeArabicText(content);
+        const isLeagueLike = featureKeyNorm === 'league' || contentNorm.includes('دوري') || featureValueNorm.includes('دوري');
 
-        if (!content || !featureKey || !featureValue || isTooSimilarQuestion(content, historyNormalizedQuestions)) {
+        if (!content || !featureKey || !featureValue || isLeagueLike || isTooSimilarQuestion(content, historyNormalizedQuestions)) {
           return res.json({
             type: 'question',
-            content: 'هل يلعب في أوروبا؟'
+            content: 'هل يلعب كمهاجم؟'
           });
         }
 
@@ -1169,7 +1177,7 @@ ${JSON.stringify(history.map(h => h?.question ?? ''), null, 2)}
     if (!openai) {
       return res.json({
         type: 'question',
-        content: 'هل يلعب في أوروبا؟'
+        content: 'هل يلعب كمهاجم؟'
       });
     }
 
@@ -1196,7 +1204,7 @@ ${JSON.stringify(history.map(h => h?.question ?? ''), null, 2)}
     const aiResponse = JSON.parse(completion.choices[0].message.content);
     return res.json({
       type: 'question',
-      content: String(aiResponse?.content ?? 'هل يلعب في أوروبا؟')
+      content: String(aiResponse?.content ?? 'هل يلعب كمهاجم؟')
     });
 
   } catch (error) {
