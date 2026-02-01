@@ -122,6 +122,70 @@ const openai = process.env.DEEPSEEK_API_KEY
 // Serper API for real-time web search
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
+// Smart fallback questions system - prevents repetition
+const FALLBACK_QUESTIONS = [
+  'هل يلعب في أوروبا؟',
+  'هل هو لاعب معتزل؟',
+  'هل يلعب كمهاجم؟',
+  'هل لعب في الدوريات الخمسة الكبرى؟',
+  'هل فاز بدوري الأبطال؟',
+  'هل يلعب في إنجلترا؟',
+  'هل يلعب في إسبانيا؟',
+  'هل هو أفريقي؟',
+  'هل هو من أمريكا الجنوبية؟',
+  'هل فاز بكأس العالم للأندية؟',
+  'هل يلعب في الدوري الإيطالي؟',
+  'هل يلعب في الدوري الألماني؟',
+  'هل يلعب في الدوري الفرنسي؟',
+  'هل هو آسيوي؟',
+  'هل يلعب كمدافع؟',
+  'هل يلعب في خط الوسط؟',
+  'هل هو حارس مرمى؟'
+];
+
+/**
+ * Get a smart fallback question that hasn't been asked yet
+ * @param {string[]} historyNormalizedQuestions - Array of normalized questions already asked
+ * @returns {string} A strategic fallback question
+ */
+function getSmartFallbackQuestion(historyNormalizedQuestions) {
+  // Filter out questions that have already been asked
+  const availableQuestions = FALLBACK_QUESTIONS.filter(q => {
+    return !isTooSimilarQuestion(q, historyNormalizedQuestions);
+  });
+
+  // If we still have unused questions, use the first one (highest priority)
+  if (availableQuestions.length > 0) {
+    return availableQuestions[0];
+  }
+
+  // If all fallback questions have been used, generate random strategic questions
+  const randomStrategicQuestions = [
+    'هل لعب في ريال مدريد؟',
+    'هل لعب في برشلونة؟',
+    'هل فاز بالكرة الذهبية؟',
+    'هل لعب في مانشستر يونايتد؟',
+    'هل هو أوروبي؟',
+    'هل لعب في باريس سان جيرمان؟',
+    'هل فاز بكأس العالم؟',
+    'هل لعب في ليفربول؟',
+    'هل لعب في تشيلسي؟',
+    'هل لعب في يوفنتوس؟'
+  ];
+
+  // Try to find a random question that hasn't been asked
+  const availableRandom = randomStrategicQuestions.filter(q => {
+    return !isTooSimilarQuestion(q, historyNormalizedQuestions);
+  });
+
+  if (availableRandom.length > 0) {
+    return availableRandom[Math.floor(Math.random() * availableRandom.length)];
+  }
+
+  // Last resort: return a completely random question from all options
+  return randomStrategicQuestions[Math.floor(Math.random() * randomStrategicQuestions.length)];
+}
+
 /**
  * Search for real-time football player information using Serper API
  */
@@ -1119,7 +1183,7 @@ app.post('/api/game', async (req, res) => {
         if (!openai) {
           return res.json({
             type: 'question',
-            content: 'هل يلعب كمهاجم؟'
+            content: getSmartFallbackQuestion(historyNormalizedQuestions)
           });
         }
 
@@ -1290,7 +1354,7 @@ ${history.filter(h => h?.answer === 'لا').map(h => `  ❌ ${h?.question}`).joi
           }
           return res.json({
             type: 'question',
-            content: 'هل يلعب كمهاجم؟'
+            content: getSmartFallbackQuestion(historyNormalizedQuestions)
           });
         }
 
@@ -1317,7 +1381,7 @@ ${history.filter(h => h?.answer === 'لا').map(h => `  ❌ ${h?.question}`).joi
     if (!openai) {
       return res.json({
         type: 'question',
-        content: 'هل يلعب كمهاجم؟'
+        content: getSmartFallbackQuestion(historyNormalizedQuestions)
       });
     }
 
@@ -1383,13 +1447,13 @@ OUTPUT (JSON ONLY):
     });
 
     const aiResponse = JSON.parse(completion.choices[0].message.content);
-    const fallbackContent = String(aiResponse?.content ?? 'هل يلعب كمهاجم؟');
+    const fallbackContent = String(aiResponse?.content ?? getSmartFallbackQuestion(historyNormalizedQuestions));
 
     // Validate fallback question - if banned, use safe default
     if (isBannedQuestion(fallbackContent) || isTooSimilarQuestion(fallbackContent, historyNormalizedQuestions)) {
       return res.json({
         type: 'question',
-        content: 'هل يلعب في أوروبا؟' // Safe strategic default
+        content: getSmartFallbackQuestion(historyNormalizedQuestions) // Smart strategic fallback
       });
     }
 
