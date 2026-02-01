@@ -8,7 +8,7 @@
 BEGIN;
 
 -- =====================================================
--- 🗑️ STEP 1: Delete ALL Old Data
+-- 🗑️ STEP 1: Delete ALL Old Data (in correct order!)
 -- =====================================================
 
 -- Delete game data (old sessions from dumb AI)
@@ -20,15 +20,15 @@ DELETE FROM public.questions_metadata;
 DELETE FROM public.player_features;
 DELETE FROM public.features;
 
--- Delete player paths if exists
+-- Delete question transitions FIRST (before question_nodes to avoid FK constraint)
 DO $$
 BEGIN
-    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'player_paths') THEN
-        DELETE FROM public.player_paths;
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'question_transitions') THEN
+        DELETE FROM public.question_transitions;
     END IF;
 END $$;
 
--- Delete question nodes if exists
+-- Delete question nodes AFTER transitions
 DO $$
 BEGIN
     IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'question_nodes') THEN
@@ -36,11 +36,11 @@ BEGIN
     END IF;
 END $$;
 
--- Delete question transitions if exists
+-- Delete player paths if exists
 DO $$
 BEGIN
-    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'question_transitions') THEN
-        DELETE FROM public.question_transitions;
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'player_paths') THEN
+        DELETE FROM public.player_paths;
     END IF;
 END $$;
 
