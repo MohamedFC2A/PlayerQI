@@ -1146,8 +1146,25 @@ ${JSON.stringify(history.map(h => h?.question ?? ''), null, 2)}
         const featureValueNorm = normalizeArabicText(featureValue);
         const contentNorm = normalizeArabicText(content);
         const isLeagueLike = featureKeyNorm === 'league' || contentNorm.includes('دوري') || featureValueNorm.includes('دوري');
+        const allowedFeatureKeys = new Set([
+          'position',
+          'nationality',
+          'continent',
+          'retired',
+          'foot',
+          'height_bucket',
+          'age_bucket',
+          'club',
+          'national_team',
+          'award'
+        ]);
+        const candidateCount = candidateNames.length;
+        const positiveCount = positivePlayers.length;
+        const splitRatio = candidateCount > 0 ? positiveCount / candidateCount : 0;
+        const isBadSplit = candidateCount >= 8 && (splitRatio < 0.15 || splitRatio > 0.85);
+        const isBadKey = featureKeyNorm && !allowedFeatureKeys.has(featureKeyNorm);
 
-        if (!content || !featureKey || !featureValue || isLeagueLike || isTooSimilarQuestion(content, historyNormalizedQuestions)) {
+        if (!content || !featureKey || !featureValue || isLeagueLike || isBadKey || isBadSplit || isTooSimilarQuestion(content, historyNormalizedQuestions)) {
           return res.json({
             type: 'question',
             content: 'هل يلعب كمهاجم؟'

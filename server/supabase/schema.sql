@@ -250,6 +250,8 @@ stable
 as $$
 declare
   asked_feature_ids uuid[];
+  asked_feature_keys text[];
+  asked_question_norms text[];
   n integer;
   total_w numeric;
   total_w_ln_w numeric;
@@ -329,6 +331,8 @@ begin
     )
   select
     (select array_agg(feature_id) from h_all),
+    (select array_agg(distinct f.normalized_key) from public.features f where f.id = any((select array_agg(feature_id) from h_all))),
+    (select array_agg(distinct hr.normalized_question) from h_raw hr where hr.normalized_question is not null and hr.normalized_question <> ''),
     (select count(*) from remaining),
     (select coalesce(sum(w), 0) from remaining),
     (select coalesce(sum(w_ln_w), 0) from remaining),
@@ -337,6 +341,8 @@ begin
     (select w from remaining order by w desc, name asc limit 1)
   into
     asked_feature_ids,
+    asked_feature_keys,
+    asked_question_norms,
     n,
     total_w,
     total_w_ln_w,
@@ -432,17 +438,20 @@ begin
     feature_stats as (
       select
         pf.feature_id,
+        f.normalized_key,
         count(*) as yes_n,
         sum(r.w) as yes_w,
         sum(r.w_ln_w) as yes_w_ln_w
       from remaining r
       join public.player_features pf on pf.player_id = r.id
+      join public.features f on f.id = pf.feature_id
       where asked_feature_ids is null or not (pf.feature_id = any(asked_feature_ids))
-      group by pf.feature_id
+      group by pf.feature_id, f.normalized_key
     ),
     scored as (
       select
         fs.feature_id,
+        fs.normalized_key,
         fs.yes_n,
         (n - fs.yes_n) as no_n,
         fs.yes_w,
@@ -454,6 +463,14 @@ begin
           + ((total_w - fs.yes_w) / total_w) * public.entropy_from_sums((total_w - fs.yes_w), (total_w_ln_w - fs.yes_w_ln_w)) as expected_entropy
       from feature_stats fs
       where fs.yes_n > 0 and fs.yes_n < n and fs.yes_w > 0 and fs.yes_w < total_w
+        and (
+          n < 20
+          or (
+            fs.yes_w >= (total_w * 0.08) and fs.yes_w <= (total_w * 0.92)
+            and fs.yes_n >= greatest(2, floor(n * 0.08)::int)
+            and fs.yes_n <= (n - greatest(2, floor(n * 0.08)::int))
+          )
+        )
     ),
     best as (
       select
@@ -462,12 +479,33 @@ begin
         qpick.id as question_id,
         qpick.question_text,
         qpick.manual_weight,
-        (s.entropy_before - s.expected_entropy) * (1 + greatest(-0.95, qpick.manual_weight)) as score
+        (1 - (abs((s.yes_w) - (total_w - s.yes_w)) / total_w)) as balance,
+        case
+          when s.normalized_key = 'league' and asked_feature_keys is not null and ('league' = any(asked_feature_keys)) then 0.12
+          when asked_feature_keys is not null and (s.normalized_key = any(asked_feature_keys)) then 0.5
+          else 1
+        end as key_penalty,
+        (s.entropy_before - s.expected_entropy)
+          * (1 - (abs((s.yes_w) - (total_w - s.yes_w)) / total_w))
+          * (case
+              when s.normalized_key = 'league' and asked_feature_keys is not null and ('league' = any(asked_feature_keys)) then 0.12
+              when asked_feature_keys is not null and (s.normalized_key = any(asked_feature_keys)) then 0.5
+              else 1
+            end)
+          * (1 + greatest(-0.95, qpick.manual_weight)) as score
       from scored s
       join lateral (
         select q.id, q.question_text, q.manual_weight
         from public.questions_metadata q
         where q.feature_id = s.feature_id
+          and (
+            asked_question_norms is null
+            or not exists (
+              select 1
+              from unnest(asked_question_norms) aq
+              where aq is not null and similarity(q.normalized_text, aq) >= 0.88
+            )
+          )
         order by q.manual_weight desc, q.success_count desc, q.seen_count desc, q.updated_at desc
         limit 1
       ) qpick on true
