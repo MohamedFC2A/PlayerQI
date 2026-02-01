@@ -1,83 +1,67 @@
 -- =====================================================
--- 🗑️ PlayerQI Database RESET Script
+-- 🔄 PlayerQI Database RESET Script
 -- =====================================================
--- This script clears ALL old/corrupted data and resets
--- the database to a fresh state for the new smart AI
+-- Removes ALL corrupted data from old AI
+-- Inserts fresh strategic data for new smart AI
 -- =====================================================
 
 BEGIN;
 
--- 1. Delete all game session data (old games with bad questions)
+-- =====================================================
+-- 🗑️ STEP 1: Delete ALL Old Data
+-- =====================================================
+
+-- Delete game data (old sessions from dumb AI)
 DELETE FROM public.game_moves;
 DELETE FROM public.game_sessions;
 
--- 2. Delete all question metadata (old question formulations)
+-- Delete all learned questions and features
 DELETE FROM public.questions_metadata;
-
--- 3. Delete all player features (old AI learnings)
 DELETE FROM public.player_features;
-
--- 4. Delete all features (old feature definitions)
 DELETE FROM public.features;
 
--- 5. Delete all learned player paths (old AI paths)
--- This table if exists
+-- Delete player paths if exists
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT FROM pg_tables 
-        WHERE schemaname = 'public' 
-        AND tablename = 'player_paths'
-    ) THEN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'player_paths') THEN
         DELETE FROM public.player_paths;
     END IF;
 END $$;
 
--- 6. Delete all question nodes (old question formulations)
+-- Delete question nodes if exists
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT FROM pg_tables 
-        WHERE schemaname = 'public' 
-        AND tablename = 'question_nodes'
-    ) THEN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'question_nodes') THEN
         DELETE FROM public.question_nodes;
     END IF;
 END $$;
 
--- 7. Delete all question transitions (old paths)
+-- Delete question transitions if exists
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT FROM pg_tables 
-        WHERE schemaname = 'public' 
-        AND tablename = 'question_transitions'
-    ) THEN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'question_transitions') THEN
         DELETE FROM public.question_transitions;
     END IF;
 END $$;
 
--- 8. Keep candidates but reset their learned data
--- We keep the player names but reset their stats
-UPDATE public.candidates 
-SET prior_weight = 1, 
-    updated_at = NOW();
+-- Reset candidate weights
+UPDATE public.candidates SET prior_weight = 1, updated_at = NOW();
 
 -- =====================================================
--- ✅ Insert Fresh Data for New AI
+-- ✨ STEP 2: Insert Strategic Features
 -- =====================================================
 
--- Insert proper features (NOT league!)
-INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value)
-VALUES
-  -- Continents
+-- Insert continents (FIRST priority questions)
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
   ('continent', 'Europe', 'continent', 'europe'),
   ('continent', 'South America', 'continent', 'south america'),
   ('continent', 'Africa', 'continent', 'africa'),
   ('continent', 'Asia', 'continent', 'asia'),
-  ('continent', 'North America', 'continent', 'north america'),
-  
-  -- Nationalities
+  ('continent', 'North America', 'continent', 'north america')
+ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
+
+-- Insert nationalities
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
   ('nationality', 'Argentina', 'nationality', 'argentina'),
   ('nationality', 'Portugal', 'nationality', 'portugal'),
   ('nationality', 'Egypt', 'nationality', 'egypt'),
@@ -86,22 +70,30 @@ VALUES
   ('nationality', 'Brazil', 'nationality', 'brazil'),
   ('nationality', 'Belgium', 'nationality', 'belgium'),
   ('nationality', 'England', 'nationality', 'england'),
-  ('nationality', 'Germany', 'nationality', 'germany'),
   ('nationality', 'Spain', 'nationality', 'spain'),
   ('nationality', 'Poland', 'nationality', 'poland'),
   ('nationality', 'Croatia', 'nationality', 'croatia'),
-  
-  -- Positions
+  ('nationality', 'Netherlands', 'nationality', 'netherlands'),
+  ('nationality', 'Germany', 'nationality', 'germany'),
+  ('nationality', 'Italy', 'nationality', 'italy')
+ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
+
+-- Insert positions
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
   ('position', 'Forward', 'position', 'forward'),
   ('position', 'Midfielder', 'position', 'midfielder'),
   ('position', 'Defender', 'position', 'defender'),
-  ('position', 'Goalkeeper', 'position', 'goalkeeper'),
-  
-  -- Retired Status
+  ('position', 'Goalkeeper', 'position', 'goalkeeper')
+ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
+
+-- Insert retired status
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
   ('retired', 'Yes', 'retired', 'yes'),
-  ('retired', 'No', 'retired', 'no'),
-  
-  -- Clubs (use actual club names, not leagues)
+  ('retired', 'No', 'retired', 'no')
+ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
+
+-- Insert top clubs (NO LEAGUES!)
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
   ('club', 'Manchester City', 'club', 'manchester city'),
   ('club', 'Liverpool', 'club', 'liverpool'),
   ('club', 'Real Madrid', 'club', 'real madrid'),
@@ -110,60 +102,81 @@ VALUES
   ('club', 'Al Nassr', 'club', 'al nassr'),
   ('club', 'Paris Saint-Germain', 'club', 'paris saint germain'),
   ('club', 'Bayern Munich', 'club', 'bayern munich'),
-  
-  -- Awards
-  ('award', 'World Cup', 'award', 'world cup'),
-  ('award', 'Champions League', 'award', 'champions league'),
-  ('award', 'Ballon d''Or', 'award', 'ballon dor')
+  ('club', 'Chelsea', 'club', 'chelsea'),
+  ('club', 'Manchester United', 'club', 'manchester united'),
+  ('club', 'Arsenal', 'club', 'arsenal'),
+  ('club', 'Juventus', 'club', 'juventus'),
+  ('club', 'AC Milan', 'club', 'ac milan'),
+  ('club', 'Inter Milan', 'club', 'inter milan'),
+  ('club', 'Atletico Madrid', 'club', 'atletico madrid')
 ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
 
--- Insert strategic questions (NO LEAGUE QUESTIONS!)
+-- Insert awards
+INSERT INTO public.features (feature_key, feature_value, normalized_key, normalized_value) VALUES
+  ('award', 'World Cup', 'award', 'world cup'),
+  ('award', 'Champions League', 'award', 'champions league'),
+  ('award', 'Ballon d''Or', 'award', 'ballon dor'),
+  ('award', 'Golden Boot', 'award', 'golden boot')
+ON CONFLICT (normalized_key, normalized_value) DO NOTHING;
+
+-- =====================================================
+-- 📝 STEP 3: Insert Strategic Questions
+-- =====================================================
+
 INSERT INTO public.questions_metadata (feature_id, question_text, normalized_text, manual_weight)
-SELECT f.id, q.question_text, q.normalized_text, q.manual_weight
+SELECT f.id, q.question_text, q.normalized_text, q.manual_weight::numeric
 FROM (
   VALUES
-    -- Continent questions (FIRST priority)
-    ('continent', 'europe', 'هل يلعب في أوروبا؟', 'هل يلعب في اوروبا', 0.5),
-    ('continent', 'south america', 'هل هو من أمريكا الجنوبية؟', 'هل هو من امريكا الجنوبيه', 0.4),
-    ('continent', 'africa', 'هل هو من أفريقيا؟', 'هل هو من افريقيا', 0.3),
+    -- CONTINENT QUESTIONS (Highest priority - start game with these)
+    ('continent', 'europe', 'هل يلعب في أوروبا؟', 'هل يلعب في اوروبا', '0.5'),
+    ('continent', 'south america', 'هل هو من أمريكا الجنوبية؟', 'هل هو من امريكا الجنوبيه', '0.4'),
+    ('continent', 'africa', 'هل هو من أفريقيا؟', 'هل هو من افريقيا', '0.3'),
+    ('continent', 'asia', 'هل هو من آسيا؟', 'هل هو من اسيا', '0.2'),
     
-    -- Retired status
-    ('retired', 'yes', 'هل اعتزل اللعب؟', 'هل اعتزل اللعب', 0.3),
-    ('retired', 'no', 'هل ما زال يلعب؟', 'هل ما زال يلعب', 0),
+    -- RETIRED STATUS
+    ('retired', 'yes', 'هل اعتزل اللعب؟', 'هل اعتزل اللعب', '0.3'),
+    ('retired', 'no', 'هل ما زال يلعب؟', 'هل ما زال يلعب', '0'),
     
-    -- Positions
-    ('position', 'forward', 'هل يلعب كمهاجم؟', 'هل يلعب كمهاجم', 0),
-    ('position', 'midfielder', 'هل يلعب كلاعب وسط؟', 'هل يلعب كلاعب وسط', 0),
-    ('position', 'defender', 'هل يلعب كمدافع؟', 'هل يلعب كمدافع', 0),
-    ('position', 'goalkeeper', 'هل هو حارس مرمى؟', 'هل هو حارس مرمي', 0),
+    -- POSITIONS
+    ('position', 'forward', 'هل يلعب كمهاجم؟', 'هل يلعب كمهاجم', '0'),
+    ('position', 'midfielder', 'هل يلعب كلاعب وسط؟', 'هل يلعب كلاعب وسط', '0'),
+    ('position', 'defender', 'هل يلعب كمدافع؟', 'هل يلعب كمدافع', '0'),
+    ('position', 'goalkeeper', 'هل هو حارس مرمى؟', 'هل هو حارس مرمي', '0'),
     
-    -- Nationalities (specific)
-    ('nationality', 'argentina', 'هل هو أرجنتيني؟', 'هل هو ارجنتيني', 0),
-    ('nationality', 'portugal', 'هل هو برتغالي؟', 'هل هو برتغالي', 0),
-    ('nationality', 'egypt', 'هل هو مصري؟', 'هل هو مصري', 0),
-    ('nationality', 'france', 'هل هو فرنسي؟', 'هل هو فرنسي', 0),
-    ('nationality', 'norway', 'هل هو نرويجي؟', 'هل هو نرويجي', 0),
-    ('nationality', 'brazil', 'هل هو برازيلي؟', 'هل هو برازيلي', 0),
+    -- MAJOR NATIONALITIES
+    ('nationality', 'argentina', 'هل هو أرجنتيني؟', 'هل هو ارجنتيني', '0'),
+    ('nationality', 'portugal', 'هل هو برتغالي؟', 'هل هو برتغالي', '0'),
+    ('nationality', 'egypt', 'هل هو مصري؟', 'هل هو مصري', '0'),
+    ('nationality', 'france', 'هل هو فرنسي؟', 'هل هو فرنسي', '0'),
+    ('nationality', 'brazil', 'هل هو برازيلي؟', 'هل هو برازيلي', '0'),
+    ('nationality', 'norway', 'هل هو نرويجي؟', 'هل هو نرويجي', '0'),
+    ('nationality', 'belgium', 'هل هو بلجيكي؟', 'هل هو بلجيكي', '0'),
+    ('nationality', 'england', 'هل هو إنجليزي؟', 'هل هو انجليزي', '0'),
+    ('nationality', 'spain', 'هل هو إسباني؟', 'هل هو اسباني', '0'),
     
-    -- Clubs (specific)
-    ('club', 'manchester city', 'هل يلعب لمانشستر سيتي؟', 'هل يلعب لمانشستر سيتي', 0),
-    ('club', 'liverpool', 'هل يلعب لليفربول؟', 'هل يلعب لليفربول', 0),
-    ('club', 'real madrid', 'هل لعب لريال مدريد؟', 'هل لعب لريال مدريد', 0),
-    ('club', 'barcelona', 'هل لعب لبرشلونة؟', 'هل لعب لبرشلونه', 0),
-    ('club', 'inter miami', 'هل يلعب لإنتر ميامي؟', 'هل يلعب لانتر ميامي', 0),
-    ('club', 'al nassr', 'هل يلعب للنصر السعودي؟', 'هل يلعب للنصر السعودي', 0),
-    ('club', 'paris saint-germain', 'هل يلعب لباريس سان جيرمان؟', 'هل يلعب لباريس سان جيرمان', 0),
+    -- TOP CLUBS
+    ('club', 'manchester city', 'هل يلعب لمانشستر سيتي؟', 'هل يلعب لمانشستر سيتي', '0'),
+    ('club', 'liverpool', 'هل يلعب لليفربول؟', 'هل يلعب لليفربول', '0'),
+    ('club', 'real madrid', 'هل لعب لريال مدريد؟', 'هل لعب لريال مدريد', '0'),
+    ('club', 'barcelona', 'هل لعب لبرشلونة؟', 'هل لعب لبرشلونه', '0'),
+    ('club', 'inter miami', 'هل يلعب لإنتر ميامي؟', 'هل يلعب لانتر ميامي', '0'),
+    ('club', 'al nassr', 'هل يلعب للنصر؟', 'هل يلعب للنصر', '0'),
+    ('club', 'paris saint-germain', 'هل يلعب لباريس سان جيرمان؟', 'هل يلعب لباريس سان جيرمان', '0'),
+    ('club', 'bayern munich', 'هل لعب لبايرن ميونخ؟', 'هل لعب لبايرن ميونخ', '0'),
+    ('club', 'manchester united', 'هل لعب لمانشستر يونايتد؟', 'هل لعب لمانشستر يونايتد', '0'),
     
-    -- Awards
-    ('award', 'world cup', 'هل فاز بكأس العالم؟', 'هل فاز بكاس العالم', 0),
-    ('award', 'champions league', 'هل فاز بدوري الأبطال؟', 'هل فاز بدوري الابطال', 0),
-    ('award', 'ballon dor', 'هل فاز بالكرة الذهبية؟', 'هل فاز بالكره الذهبيه', 0)
+    -- AWARDS
+    ('award', 'world cup', 'هل فاز بكأس العالم؟', 'هل فاز بكاس العالم', '0'),
+    ('award', 'champions league', 'هل فاز بدوري الأبطال؟', 'هل فاز بدوري الابطال', '0'),
+    ('award', 'ballon dor', 'هل فاز بالكرة الذهبية؟', 'هل فاز بالكره الذهبيه', '0')
 ) as q(feature_key, feature_value, question_text, normalized_text, manual_weight)
-JOIN public.features f
-  ON f.normalized_key = q.feature_key AND f.normalized_value = q.feature_value
+JOIN public.features f ON f.normalized_key = q.feature_key AND f.normalized_value = q.feature_value
 ON CONFLICT (feature_id, normalized_text) DO NOTHING;
 
--- Insert player features (accurate mappings)
+-- =====================================================
+-- 👥 STEP 4: Map Players to Features
+-- =====================================================
+
 INSERT INTO public.player_features (player_id, feature_id, source, confidence)
 SELECT c.id, f.id, 'seed', 1.0
 FROM public.candidates c
@@ -195,6 +208,14 @@ JOIN public.features f ON (
   (c.normalized_name = 'mohamed salah' AND f.normalized_key = 'club' AND f.normalized_value = 'liverpool') OR
   (c.normalized_name = 'mohamed salah' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
   
+  -- Kylian Mbappé
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'nationality' AND f.normalized_value = 'france') OR
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'position' AND f.normalized_value = 'forward') OR
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'club' AND f.normalized_value = 'paris saint-germain') OR
+  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'award' AND f.normalized_value = 'world cup') OR
+  
   -- Erling Haaland
   (c.normalized_name = 'erling haaland' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
   (c.normalized_name = 'erling haaland' AND f.normalized_key = 'nationality' AND f.normalized_value = 'norway') OR
@@ -203,20 +224,46 @@ JOIN public.features f ON (
   (c.normalized_name = 'erling haaland' AND f.normalized_key = 'club' AND f.normalized_value = 'manchester city') OR
   (c.normalized_name = 'erling haaland' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
   
-  -- Kylian Mbappé
-  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
-  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'nationality' AND f.normalized_value = 'france') OR
-  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'position' AND f.normalized_value = 'forward') OR
-  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
-  (c.normalized_name = 'kylian mbappe' AND f.normalized_key = 'award' AND f.normalized_value = 'world cup') OR
-  
   -- Kevin De Bruyne
   (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
   (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'nationality' AND f.normalized_value = 'belgium') OR
   (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'position' AND f.normalized_value = 'midfielder') OR
   (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
   (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'club' AND f.normalized_value = 'manchester city') OR
-  (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league')
+  (c.normalized_name = 'kevin de bruyne' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
+  
+  -- Neymar
+  (c.normalized_name = 'neymar' AND f.normalized_key = 'continent' AND f.normalized_value = 'south america') OR
+  (c.normalized_name = 'neymar' AND f.normalized_key = 'nationality' AND f.normalized_value = 'brazil') OR
+  (c.normalized_name = 'neymar' AND f.normalized_key = 'position' AND f.normalized_value = 'forward') OR
+  (c.normalized_name = 'neymar' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
+  (c.normalized_name = 'neymar' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
+  
+  -- Karim Benzema
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'nationality' AND f.normalized_value = 'france') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'position' AND f.normalized_value = 'forward') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'club' AND f.normalized_value = 'al nassr') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
+  (c.normalized_name = 'karim benzema' AND f.normalized_key = 'award' AND f.normalized_value = 'ballon dor') OR
+  
+  -- Luka Modrić
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'nationality' AND f.normalized_value = 'croatia') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'position' AND f.normalized_value = 'midfielder') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'club' AND f.normalized_value = 'real madrid') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league') OR
+  (c.normalized_name = 'luka modric' AND f.normalized_key = 'award' AND f.normalized_value = 'ballon dor') OR
+  
+  -- Robert Lewandowski
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'continent' AND f.normalized_value = 'europe') OR
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'nationality' AND f.normalized_value = 'poland') OR
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'position' AND f.normalized_value = 'forward') OR
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'retired' AND f.normalized_value = 'no') OR
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'club' AND f.normalized_value = 'barcelona') OR
+  (c.normalized_name = 'robert lewandowski' AND f.normalized_key = 'award' AND f.normalized_value = 'champions league')
 )
 ON CONFLICT (player_id, feature_id) DO NOTHING;
 
@@ -225,21 +272,35 @@ COMMIT;
 -- =====================================================
 -- ✅ Verification Queries
 -- =====================================================
--- Run these to verify the reset worked:
 
--- Check feature count (should be ~40-50)
-SELECT COUNT(*) as feature_count FROM public.features;
+SELECT '✅ RESET COMPLETE!' as status;
 
--- Check question count (should be ~25-30)
-SELECT COUNT(*) as question_count FROM public.questions_metadata;
-
--- Check player features (should be ~30-40)
-SELECT COUNT(*) as player_feature_count FROM public.player_features;
-
--- Verify NO league features exist
-SELECT COUNT(*) as league_count FROM public.features WHERE normalized_key = 'league';
--- Should be 0!
-
--- Verify game sessions are empty
-SELECT COUNT(*) as old_game_count FROM public.game_sessions;
--- Should be 0!
+SELECT 
+  'Features' as table_name,
+  COUNT(*) as count,
+  '40-50' as expected
+FROM public.features
+UNION ALL
+SELECT 
+  'Questions',
+  COUNT(*),
+  '30-40'
+FROM public.questions_metadata
+UNION ALL
+SELECT 
+  'Player Features',
+  COUNT(*),
+  '40-60'
+FROM public.player_features
+UNION ALL
+SELECT 
+  'Game Sessions (should be 0)',
+  COUNT(*),
+  '0'
+FROM public.game_sessions
+UNION ALL
+SELECT 
+  'League Features (should be 0)',
+  COUNT(*),
+  '0'
+FROM public.features WHERE normalized_key = 'league';
