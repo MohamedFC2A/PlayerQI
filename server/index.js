@@ -977,6 +977,12 @@ app.post('/api/confirm', async (req, res) => {
           .from('game_sessions')
           .update({ status: 'lost', guessed_name: guess, correct: false })
           .eq('id', sessionId);
+        
+        // Clean up active session when game ends
+        await supabase
+          .from('active_sessions')
+          .delete()
+          .eq('session_id', sessionId);
       }
 
       await recordLearningGap({
@@ -1005,6 +1011,12 @@ app.post('/api/confirm', async (req, res) => {
           question_count: Array.isArray(history) ? history.length : null,
         })
         .eq('id', sessionId);
+      
+      // Clean up active session when game ends
+      await supabase
+        .from('active_sessions')
+        .delete()
+        .eq('session_id', sessionId);
     }
 
     await learnPlayerAttributesFromHistory(playerId, history);
@@ -1053,6 +1065,12 @@ app.post('/api/confirm-final', async (req, res) => {
           question_count: Array.isArray(history) ? history.length : null,
         })
         .eq('id', sessionId);
+      
+      // Clean up active session when game ends
+      await supabase
+        .from('active_sessions')
+        .delete()
+        .eq('session_id', sessionId);
     }
 
     await learnPlayerAttributesFromHistory(playerId, history);
