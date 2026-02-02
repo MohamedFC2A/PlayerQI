@@ -991,6 +991,12 @@ app.post('/api/confirm', async (req, res) => {
           .from('active_sessions')
           .delete()
           .eq('session_id', sessionId);
+        
+        // Also clean up v2 sessions if they exist
+        await supabase
+          .from('active_sessions_v2')
+          .delete()
+          .eq('session_id', sessionId);
       }
 
       await recordLearningGap({
@@ -1020,9 +1026,15 @@ app.post('/api/confirm', async (req, res) => {
         })
         .eq('id', sessionId);
       
-      // Clean up active session when game ends
+      // Clean up active sessions when game ends
       await supabase
         .from('active_sessions')
+        .delete()
+        .eq('session_id', sessionId);
+      
+      // Also clean up v2 sessions if they exist
+      await supabase
+        .from('active_sessions_v2')
         .delete()
         .eq('session_id', sessionId);
     }
@@ -1074,9 +1086,15 @@ app.post('/api/confirm-final', async (req, res) => {
         })
         .eq('id', sessionId);
       
-      // Clean up active session when game ends
+      // Clean up active sessions when game ends
       await supabase
         .from('active_sessions')
+        .delete()
+        .eq('session_id', sessionId);
+      
+      // Also clean up v2 sessions if they exist
+      await supabase
+        .from('active_sessions_v2')
         .delete()
         .eq('session_id', sessionId);
     }

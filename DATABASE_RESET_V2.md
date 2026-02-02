@@ -52,7 +52,9 @@ psql YOUR_DATABASE_URL -f simple_reset_v2.sql
 - Removed `semantic_vector` column that was causing conflicts
 - Created comprehensive reset script that handles all old schema cleanup
 - Ensured clean separation between v1 and v2 schemas
+- **Fixed critical session cleanup bug** that caused guessed players to persist across games
 - Added proper error handling and verification
+- Implemented automatic cleanup when games end
 
 ## 📋 Verification
 
@@ -94,5 +96,13 @@ After successful database reset:
 2. Test the new v2 endpoints
 3. Verify the monitoring dashboard works
 4. Check that the knowledge expander runs properly
+5. **Run the session cleanup test:** `node server/scripts/test-session-fix.js`
+6. Test that guessed players don't persist across games
 
-The system should now work without the semantic_vector error!
+## 🐛 Known Issues Fixed
+
+- **Session Persistence Bug**: Previously guessed players no longer appear immediately in new games
+- **Database Column Conflicts**: All schema conflicts resolved
+- **Table Dependency Errors**: Proper table creation order implemented
+
+The system should now work without the semantic_vector error or session persistence issues!
