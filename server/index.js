@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
+const OpenAI = require('openai');
 const { createSupabaseClient } = require('./supabaseClient');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -12,6 +13,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 const supabase = createSupabaseClient();
+
+function createDeepSeekClient() {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) return null;
+  return new OpenAI({
+    apiKey,
+    baseURL: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+  });
+}
+
+const deepseek = createDeepSeekClient();
 
 function normalizeSimpleText(input) {
   if (!input) return '';
@@ -37,6 +49,132 @@ function toAnswerKind(input) {
   if (['maybe', 'ربما', 'جزئيا', 'جزئياً'].includes(a)) return 'maybe';
   if (['unknown', 'idk', 'لا اعرف', 'لا أعرف'].includes(a)) return 'unknown';
   return 'unknown';
+}
+
+function buildFootballOracleSystemPrompt({ history, rejectedGuesses, questionNumber }) {
+  const timeContext = new Date().toISOString();
+  const historyLines = (Array.isArray(history) && history.length > 0)
+    ? history
+      .map((h, i) => `   ${i + 1}. [${h?.question ?? ''}] => "${h?.answer ?? ''}"`)
+      .join('\n')
+    : '   (Starting Fresh)';
+
+  const rejected = Array.isArray(rejectedGuesses) && rejectedGuesses.length > 0
+    ? rejectedGuesses.join(', ')
+    : '';
+
+  return `
+You are "The Football Oracle" 🧠⚽.
+Your Goal: Identify the secret player in the user's mind using pure logic, deduction, and football knowledge.
+
+Time Context: ${timeContext} (Current Season Data).
+
+═══════════════════════════════════════════════════════════════
+🚫 STRICT "MEMORY & LOGIC" RULES (NON-NEGOTIABLE)
+═══════════════════════════════════════════════════════════════
+1. **DEEP MEMORY:** Analyze the \`history\` array deeply.
+   - If User says "NOT Striker", you must implicitly understand he is (Midfielder OR Defender OR GK).
+   - If User says "Plays in Asia", NEVER ask about European clubs.
+   - **VIOLATION:** Asking a question that contradicts previous history is a critical failure.
+
+2. **NO REDUNDANCY:** Never repeat a question concept. "Is he a forward?" and "Does he play in attack?" are the SAME question.
+
+3. **BINARY SEARCH STRATEGY (High IQ):**
+   - Do NOT fish for random guesses.
+   - Ask questions that eliminate ~50% of the remaining candidates.
+
+4. **DYNAMIC GENERATION (No Scripts):**
+   - Generate questions LIVE based on the remaining pool of players in your mind.
+   - If the user answers "I don't know" often, switch to easier, more famous traits.
+
+═══════════════════════════════════════════════════════════════
+🎯 THE "KILL SHOT" (Early Guessing)
+═══════════════════════════════════════════════════════════════
+- **Threshold:** If your confidence in a specific player > 85%, STOP ASKING.
+- **Action:** Output \`type: "guess"\` immediately.
+
+═══════════════════════════════════════════════════════════════
+📜 CURRENT INVESTIGATION STATE
+═══════════════════════════════════════════════════════════════
+• Question #: ${questionNumber} / 15
+• Validated Facts (History):
+${historyLines}
+• Rejected Suspects (Do NOT Guess These):
+${rejected}
+
+═══════════════════════════════════════════════════════════════
+📝 OUTPUT FORMAT (JSON ONLY)
+═══════════════════════════════════════════════════════════════
+Return a single JSON object. No markdown. Do NOT include step-by-step reasoning.
+{
+  "reason": "Brief 1-sentence rationale (no chain-of-thought).",
+  "type": "question" | "guess",
+  "content": "The question text (in Arabic) OR The Player Name (in Arabic)"
+}
+`.trim();
+}
+
+function safeJsonParse(input) {
+  if (typeof input !== 'string') return null;
+  try {
+    return JSON.parse(input);
+  } catch {
+    const start = input.indexOf('{');
+    const end = input.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(input.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function generateOracleMove({ history, rejectedGuesses }) {
+  if (!deepseek) return null;
+
+  const questionNumber = (Array.isArray(history) ? history.length : 0) + 1;
+  const systemPrompt = buildFootballOracleSystemPrompt({ history, rejectedGuesses, questionNumber });
+
+  const resp = await deepseek.chat.completions.create({
+    model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: 'ابدأ الآن.' },
+    ],
+    response_format: { type: 'json_object' },
+  }).catch(() => null);
+
+  const content = resp?.choices?.[0]?.message?.content ?? '';
+  const parsed = safeJsonParse(content);
+  if (!parsed) return null;
+
+  const type = String(parsed?.type ?? '').trim().toLowerCase();
+  const contentText = typeof parsed?.content === 'string' ? parsed.content.trim() : '';
+
+  if (!contentText) return null;
+  if (type !== 'question' && type !== 'guess') return null;
+
+  const normalized = normalizeSimpleText(contentText);
+  const asked = new Set(
+    (Array.isArray(history) ? history : [])
+      .map((h) => normalizeSimpleText(h?.question))
+      .filter(Boolean),
+  );
+
+  if (type === 'question' && normalized && asked.has(normalizeSimpleText(contentText))) {
+    return null;
+  }
+
+  const rejected = new Set((Array.isArray(rejectedGuesses) ? rejectedGuesses : []).map(normalizeSimpleText).filter(Boolean));
+  if (type === 'guess' && rejected.has(normalizeSimpleText(contentText))) {
+    return null;
+  }
+
+  return { type, content: contentText };
 }
 
 const FALLBACK_QUESTIONS = [
@@ -509,6 +647,8 @@ app.post('/api/game', async (req, res) => {
     const sessionIdInput = String(req.body?.session_id ?? req.body?.sessionId ?? '').trim() || null;
 
     if (!supabase) {
+      const aiMove = await generateOracleMove({ history, rejectedGuesses });
+      if (aiMove) return res.json(aiMove);
       return res.json({ type: 'question', content: pickFallbackQuestion(history) });
     }
 
@@ -534,6 +674,13 @@ app.post('/api/game', async (req, res) => {
     ]);
 
     if (!summary || summary.candidate_count === 0) {
+      const aiMove = await generateOracleMove({ history, rejectedGuesses });
+      if (aiMove) {
+        return res.json({
+          ...aiMove,
+          session_id: sessionId ?? null,
+        });
+      }
       return res.json({
         type: 'question',
         content: pickFallbackQuestion(history),
@@ -611,6 +758,23 @@ app.post('/api/game', async (req, res) => {
     );
 
     if (!best || !best.question_text) {
+      const aiMove = await generateOracleMove({ history, rejectedGuesses });
+      if (aiMove) {
+        await persistSessionState({
+          sessionId,
+          history: resolvedHistory,
+          constraintState,
+          rejectedGuessNames,
+          summary,
+          topProb,
+          move: { ...aiMove, meta: metaBase },
+        });
+
+        return res.json({
+          ...aiMove,
+          session_id: sessionId ?? null,
+        });
+      }
       const fallback = pickFallbackQuestion(history);
       const move = { type: 'question', content: fallback, meta: metaBase };
 
