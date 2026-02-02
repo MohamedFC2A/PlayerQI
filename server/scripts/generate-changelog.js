@@ -97,7 +97,7 @@ async function getLastChangelogVersion(supabase) {
     .maybeSingle();
 
   if (error) return null;
-  return data?.version ?? null;
+  return data ?? null;
 }
 
 function getPackageJsonVersion() {
@@ -123,7 +123,16 @@ async function buildCommitRange({ lastChangelogVersion, lastTag }) {
   return null;
 }
 
-async function fetchCommitSubjectsSince(ref) {
+async function fetchCommitSubjectsSince(baseline) {
+  if (baseline?.type === 'since' && baseline.value) {
+    const out = await runGit(['log', `--since=${baseline.value}`, '--no-merges', '--pretty=format:%s']);
+    return String(out ?? '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  const ref = baseline?.type === 'ref' ? baseline.value : null;
   const range = ref ? `${ref}..HEAD` : 'HEAD';
   const out = await runGit(['log', range, '--no-merges', '--pretty=format:%s']);
   return String(out ?? '')
@@ -200,10 +209,19 @@ async function main() {
     lastTag = null;
   }
 
-  const lastChangelogVersion = await getLastChangelogVersion(supabase);
-  const baseRef = await buildCommitRange({ lastChangelogVersion, lastTag });
+  const lastChangelog = await getLastChangelogVersion(supabase);
+  const lastChangelogVersion = lastChangelog?.version ?? null;
+  const lastChangelogDate = lastChangelog?.release_date ? new Date(lastChangelog.release_date) : null;
 
-  const commitSubjects = await fetchCommitSubjectsSince(baseRef);
+  let baseline = null;
+  if (lastChangelogDate && !Number.isNaN(lastChangelogDate.getTime())) {
+    baseline = { type: 'since', value: lastChangelogDate.toISOString() };
+  } else {
+    const baseRef = await buildCommitRange({ lastChangelogVersion, lastTag });
+    baseline = baseRef ? { type: 'ref', value: baseRef } : null;
+  }
+
+  const commitSubjects = await fetchCommitSubjectsSince(baseline);
   if (!Array.isArray(commitSubjects) || commitSubjects.length === 0) {
     // eslint-disable-next-line no-console
     console.log('No new commits since last release baseline. Nothing to publish.');
