@@ -167,7 +167,7 @@ create table public.game_sessions (
   correct boolean,
   question_count integer,
   duration_ms integer,
-  player_profile_id uuid references public.player_profiles(id) on delete set null,
+  player_profile_id uuid, -- Will reference player_profiles later
   average_response_time integer,
   behavioral_cluster text,
   session_difficulty numeric(3,2),
@@ -522,6 +522,11 @@ drop trigger if exists update_game_sessions_updated_at on public.game_sessions;
 create trigger update_game_sessions_updated_at
   before update on public.game_sessions
   for each row execute function public.update_updated_at_column();
+
+-- Add foreign key constraint now that player_profiles exists
+alter table public.game_sessions 
+add constraint fk_game_sessions_player_profile 
+foreign key (player_profile_id) references public.player_profiles(id) on delete set null;
 
 -- =====================================================
 -- STEP 7: FINALIZE

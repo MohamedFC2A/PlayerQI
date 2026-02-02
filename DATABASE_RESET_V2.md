@@ -12,17 +12,26 @@ The error `column "semantic_vector" does not exist` occurred due to conflicts be
 
 ## 🛠️ How to Reset Your Database
 
-### Option 1: Using the Reset Script (Recommended)
+### Option 1: Using the Simple Reset Script (RECOMMENDED - Fewer Dependencies)
 ```bash
 # Navigate to supabase directory
 cd server/supabase
 
-# Run the reset and upgrade script
+# Run the simple reset script
 # Replace YOUR_DATABASE_URL with your actual Supabase connection string
+psql YOUR_DATABASE_URL -f simple_reset_v2.sql
+```
+
+### Option 2: Using the Full Reset Script
+```bash
+# Navigate to supabase directory
+cd server/supabase
+
+# Run the comprehensive reset and upgrade script
 psql YOUR_DATABASE_URL -f reset_and_upgrade_v2.sql
 ```
 
-### Option 2: Manual Reset Steps
+### Option 3: Manual Reset Steps
 If you prefer to do it manually:
 
 1. **Connect to your Supabase database**
@@ -33,9 +42,9 @@ DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 ```
 
-3. **Then apply the new schema:**
+3. **Then apply the simple schema:**
 ```bash
-psql YOUR_DATABASE_URL -f schema_v2.sql
+psql YOUR_DATABASE_URL -f simple_reset_v2.sql
 ```
 
 ## 🔧 What Was Fixed
