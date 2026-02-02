@@ -39,11 +39,11 @@ drop function if exists public.bump_question_success(uuid);
 drop function if exists public.match_player(text, real);
 drop function if exists public.match_question(text, real);
 drop function if exists public.entropy_from_sums(numeric, numeric);
-drop function if exists public.enforce_question_uniqueness();
-drop function if exists public.questions_set_normalized_text();
-drop function if exists public.attributes_set_normalized_fields();
-drop function if exists public.players_set_normalized_name();
-drop function if exists public.touch_updated_at();
+drop function if exists public.enforce_question_uniqueness() cascade;
+drop function if exists public.questions_set_normalized_text() cascade;
+drop function if exists public.attributes_set_normalized_fields() cascade;
+drop function if exists public.players_set_normalized_name() cascade;
+drop function if exists public.touch_updated_at() cascade;
 drop function if exists public.normalize_simple_text(text);
 
 drop table if exists public.question_transitions cascade;
@@ -533,7 +533,7 @@ begin
 
   entropy_before := public.entropy_from_sums(total_w::numeric, total_w_ln_w::numeric);
 
-  if n <= 3 or top_prob >= 0.85 then
+  if n <= 5 or top_prob >= 0.75 then
     return jsonb_build_object(
       'type', 'guess',
       'player_id', top_player_id,
@@ -680,13 +680,6 @@ begin
       where total_w > 0
         and (s.yes_w_known + ((total_w - s.yes_w_known - s.no_w_known) / 2)) > 0
         and (s.no_w_known + ((total_w - s.yes_w_known - s.no_w_known) / 2)) > 0
-        and (
-          n < 20
-          or (
-            (s.yes_w_known + ((total_w - s.yes_w_known - s.no_w_known) / 2)) >= (total_w * 0.08)
-            and (s.yes_w_known + ((total_w - s.yes_w_known - s.no_w_known) / 2)) <= (total_w * 0.92)
-          )
-        )
     ),
     best as (
       select
@@ -724,18 +717,9 @@ begin
         select q.id, q.question_text, q.manual_weight
         from public.questions q
         where q.attribute_id = s.attribute_id
-          and (
-            asked_question_norms is null
-            or not exists (
-              select 1
-              from unnest(asked_question_norms) aq
-              where aq is not null and similarity(q.normalized_text, aq) >= 0.88
-            )
-          )
         order by q.manual_weight desc, q.success_count desc, q.seen_count desc, q.updated_at desc
         limit 1
       ) qpick on true
-      where (s.entropy_before - s.expected_entropy) >= 0.0003
       order by score desc, info_gain desc
       limit 1
     )
@@ -759,16 +743,14 @@ begin
 
   if best_attribute_id is null or best_question_id is null or best_question_text is null then
     return jsonb_build_object(
-      'type', 'gap',
-      'reason', 'no_good_question',
+      'type', 'guess',
+      'player_id', top_player_id,
+      'content', top_player_name,
+      'confidence', top_prob,
       'meta', jsonb_build_object(
         'remaining', n,
         'entropy', entropy_before,
-        'top_player', jsonb_build_object(
-          'player_id', top_player_id,
-          'name', top_player_name,
-          'confidence', top_prob
-        )
+        'reason', 'no_good_question_guess'
       )
     );
   end if;
