@@ -29,6 +29,23 @@ end $$;
 drop view if exists public.view_game_stats cascade;
 drop view if exists public.view_player_attribute_editor cascade;
 
+-- Drop RPCs first (avoids parameter-name/signature issues across iterations)
+drop function if exists public.game_start();
+drop function if exists public.game_step(uuid, uuid, uuid, public.answer_kind, text[]);
+drop function if exists public.get_optimal_move(uuid);
+drop function if exists public.get_optimal_move(jsonb, text[]);
+drop function if exists public.bump_question_seen(uuid);
+drop function if exists public.bump_question_success(uuid);
+drop function if exists public.match_player(text, real);
+drop function if exists public.match_question(text, real);
+drop function if exists public.entropy_from_sums(numeric, numeric);
+drop function if exists public.enforce_question_uniqueness();
+drop function if exists public.questions_set_normalized_text();
+drop function if exists public.attributes_set_normalized_fields();
+drop function if exists public.players_set_normalized_name();
+drop function if exists public.touch_updated_at();
+drop function if exists public.normalize_simple_text(text);
+
 drop table if exists public.question_transitions cascade;
 drop table if exists public.question_nodes cascade;
 drop table if exists public.player_paths cascade;
@@ -41,11 +58,17 @@ drop table if exists public.questions_metadata cascade;
 drop table if exists public.features cascade;
 drop table if exists public.candidates cascade;
 
+-- Drop new schema tables too (wipe & rebuild; avoids mismatched columns from Table Editor)
+drop table if exists public.player_attributes cascade;
+drop table if exists public.questions cascade;
+drop table if exists public.attributes cascade;
+drop table if exists public.players cascade;
+
 -- -----------------------------------------------------
 -- Core entities
 -- -----------------------------------------------------
 
-create table if not exists public.players (
+create table public.players (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   normalized_name text not null,
@@ -60,7 +83,7 @@ create table if not exists public.players (
 create index if not exists players_normalized_trgm
 on public.players using gin (normalized_name gin_trgm_ops);
 
-create table if not exists public.attributes (
+create table public.attributes (
   id uuid primary key default gen_random_uuid(),
   attribute_key text not null,
   attribute_value text not null,
@@ -79,7 +102,7 @@ on public.attributes(normalized_key, normalized_value);
 create index if not exists attributes_category_lookup
 on public.attributes(category, normalized_key, normalized_value);
 
-create table if not exists public.questions (
+create table public.questions (
   id uuid primary key default gen_random_uuid(),
   attribute_id uuid not null references public.attributes(id) on delete cascade,
   question_text text not null,
@@ -104,7 +127,7 @@ on public.questions using ivfflat (embedding vector_cosine_ops)
 with (lists = 100)
 where embedding is not null;
 
-create table if not exists public.player_attributes (
+create table public.player_attributes (
   player_id uuid not null references public.players(id) on delete cascade,
   attribute_id uuid not null references public.attributes(id) on delete cascade,
   value boolean not null,
@@ -122,7 +145,7 @@ on public.player_attributes(attribute_id, player_id);
 create index if not exists player_attributes_attribute_value_player
 on public.player_attributes(attribute_id, value, player_id);
 
-create table if not exists public.game_sessions (
+create table public.game_sessions (
   id uuid primary key default gen_random_uuid(),
   history jsonb not null default '[]'::jsonb,
   rejected_guess_names text[] not null default '{}'::text[],
@@ -136,7 +159,7 @@ create table if not exists public.game_sessions (
   updated_at timestamptz not null default now()
 );
 
-create table if not exists public.game_moves (
+create table public.game_moves (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.game_sessions(id) on delete cascade,
   move_index integer not null,
@@ -941,3 +964,9 @@ select
   )), '[]'::jsonb) from top_guesses) as commonly_guessed_players;
 
 commit;
+
+-- Force PostgREST schema cache refresh (important after wipe & rebuild)
+do $$
+begin
+  perform pg_notify('pgrst', 'reload schema');
+end $$;
