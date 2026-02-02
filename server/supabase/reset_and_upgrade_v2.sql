@@ -1,23 +1,130 @@
 -- =====================================================
--- PlayerQI v2.0: Hyper-Speed Cognitive Engine Schema
--- In-Database Logic for Real-Time Entropy Calculation
+-- PlayerQI v2.0 Schema Reset and Upgrade
+-- COMPLETE CLEAN SLATE FOR HYPER-SPEED ENGINE
 -- =====================================================
 
 begin;
 
--- Enable required extensions
+-- =====================================================
+-- STEP 1: DROP ALL EXISTING OBJECTS (CLEAN SLATE)
+-- =====================================================
+
+-- Drop all views
+drop view if exists public.view_game_stats cascade;
+drop view if exists public.view_player_attribute_editor cascade;
+drop view if exists public.view_attribute_best_question cascade;
+
+-- Drop all materialized views
+drop materialized view if exists public.mv_player_attribute_matrix cascade;
+drop materialized view if exists public.mv_attribute_global_stats cascade;
+
+-- Drop all functions
+drop function if exists public.get_candidate_summary(uuid[], uuid[], text[]) cascade;
+drop function if exists public.get_attribute_stats(uuid[], uuid[], uuid[], text[]) cascade;
+drop function if exists public.refresh_player_matrix_mvs() cascade;
+drop function if exists public.bump_question_seen(uuid) cascade;
+drop function if exists public.bump_question_success(uuid) cascade;
+drop function if exists public.match_player(text, real) cascade;
+drop function if exists public.match_question(text, real) cascade;
+drop function if exists public.enforce_question_uniqueness() cascade;
+drop function if exists public.questions_set_normalized_text() cascade;
+drop function if exists public.attributes_set_normalized_fields() cascade;
+drop function if exists public.players_set_normalized_name() cascade;
+drop function if exists public.touch_updated_at() cascade;
+drop function if exists public.normalize_simple_text(text) cascade;
+
+-- Drop all triggers
+drop trigger if exists trg_questions_dedupe on public.questions cascade;
+drop trigger if exists trg_questions_norm on public.questions cascade;
+drop trigger if exists trg_attributes_norm on public.attributes cascade;
+drop trigger if exists trg_players_norm on public.players cascade;
+drop trigger if exists trg_players_touch on public.players cascade;
+drop trigger if exists trg_attributes_touch on public.attributes cascade;
+drop trigger if exists trg_questions_touch on public.questions cascade;
+drop trigger if exists trg_player_matrix_touch on public.player_matrix cascade;
+drop trigger if exists trg_game_sessions_touch on public.game_sessions cascade;
+drop trigger if exists trg_active_sessions_touch on public.active_sessions cascade;
+
+-- Drop all tables (in reverse order of dependencies)
+drop table if exists public.learning_queue cascade;
+drop table if exists public.active_sessions cascade;
+drop table if exists public.game_moves cascade;
+drop table if exists public.game_sessions cascade;
+drop table if exists public.player_matrix cascade;
+drop table if exists public.questions cascade;
+drop table if exists public.attributes cascade;
+drop table if exists public.players cascade;
+drop table if exists public.project_changelogs cascade;
+
+-- Drop legacy tables
+drop table if exists public.player_features cascade;
+drop table if exists public.questions_metadata cascade;
+drop table if exists public.features cascade;
+drop table if exists public.candidates cascade;
+
+-- =====================================================
+-- STEP 2: CREATE EXTENSIONS
+-- =====================================================
+
+create extension if not exists pgcrypto;
+create extension if not exists pg_trgm;
 create extension if not exists vector;
 
--- -----------------------------------------------------
--- Core Feature Matrix Schema (The "Brain")
--- -----------------------------------------------------
+-- =====================================================
+-- STEP 3: CREATE ENUM TYPES
+-- =====================================================
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public' and t.typname = 'answer_kind'
+  ) then
+    create type public.answer_kind as enum ('yes','no','unknown','maybe');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public' and t.typname = 'project_changelog_update_type'
+  ) then
+    create type public.project_changelog_update_type as enum ('MAJOR_VERSION','FEATURE_UPDATE','HOTFIX');
+  end if;
+end $$;
+
+-- =====================================================
+-- STEP 4: CREATE CORE TABLES (v2.0)
+-- =====================================================
+
+-- Players table (core entity)
+create table public.players (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  normalized_name text not null,
+  image_url text,
+  prior_weight numeric not null default 1,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint players_prior_weight_positive check (prior_weight > 0),
+  constraint players_normalized_unique unique(normalized_name)
+);
+
+create index if not exists players_normalized_trgm
+on public.players using gin (normalized_name gin_trgm_ops);
 
 -- Attributes table (replaces text-based questions)
-create table if not exists public.attributes (
+create table public.attributes (
   id uuid primary key default gen_random_uuid(),
   category text not null, -- e.g., 'Position', 'League', 'Physical', 'Achievement'
   label_ar text not null, -- Arabic label: 'يلعب بقدمه اليسرى'
   label_en text, -- English label
+  semantic_vector vector(1536), -- For semantic deduplication
   is_exclusive boolean default false, -- For mutually exclusive groups
   attribute_group text default '', -- Group related attributes
   created_at timestamptz not null default now()
@@ -26,8 +133,12 @@ create table if not exists public.attributes (
 -- Unique constraint on Arabic labels
 create unique index if not exists attributes_label_ar_unique on public.attributes(label_ar);
 
+-- Index for semantic similarity search
+create index if not exists attributes_semantic_idx on public.attributes 
+using ivfflat (semantic_vector vector_cosine_ops);
+
 -- Player Features Matrix (The Core Intelligence)
-create table if not exists public.player_features (
+create table public.player_features (
   player_id uuid not null references public.players(id) on delete cascade,
   attribute_id uuid not null references public.attributes(id) on delete cascade,
   value integer not null check (value in (-1, 0, 1)), -- -1=No, 0=Maybe, 1=Yes
@@ -45,12 +156,28 @@ on public.player_features(attribute_id, value);
 create index if not exists idx_player_features_player 
 on public.player_features(player_id, attribute_id);
 
--- -----------------------------------------------------
--- Enhanced Session Management (Short-term Memory)
--- -----------------------------------------------------
+-- Game Sessions table
+create table public.game_sessions (
+  id uuid primary key default gen_random_uuid(),
+  history jsonb not null default '[]'::jsonb,
+  rejected_guess_names text[] not null default '{}'::text[],
+  status text not null default 'in_progress' check (status in ('in_progress','won','lost','abandoned')),
+  guessed_player_id uuid references public.players(id) on delete set null,
+  guessed_name text,
+  correct boolean,
+  question_count integer,
+  duration_ms integer,
+  player_profile_id uuid references public.player_profiles(id) on delete set null,
+  average_response_time integer,
+  behavioral_cluster text,
+  session_difficulty numeric(3,2),
+  engagement_score numeric(3,2),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 
--- Active game sessions with state tracking
-create table if not exists public.active_sessions_v2 (
+-- Enhanced Session Management (Short-term Memory)
+create table public.active_sessions_v2 (
   session_id uuid primary key references public.game_sessions(id) on delete cascade,
   eliminated_players uuid[] default '{}'::uuid[], -- Players ruled out
   confirmed_attributes uuid[] default '{}'::uuid[], -- Confirmed player characteristics
@@ -71,11 +198,33 @@ on public.active_sessions_v2(current_entropy desc);
 create index if not exists active_sessions_v2_remaining_idx 
 on public.active_sessions_v2(remaining_candidates);
 
--- -----------------------------------------------------
--- Behavioral Profiling (Lightweight, Heuristic-Based)
--- -----------------------------------------------------
-
 -- Simplified player profiles (no ML required)
+create table public.player_profiles (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  anonymous_id text,
+  skill_level numeric(3,2) check (skill_level >= 0.0 and skill_level <= 1.0),
+  confidence_score numeric(3,2) check (confidence_score >= 0.0 and confidence_score <= 1.0),
+  behavioral_cluster text check (behavioral_cluster in ('analytical', 'impulsive', 'cautious', 'inconsistent', 'expert')),
+  cultural_preferences jsonb default '{}'::jsonb,
+  historical_performance jsonb default '{}'::jsonb,
+  bias_indicators jsonb default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  
+  -- Ensure either user_id or anonymous_id is set
+  constraint player_profiles_user_or_anonymous check (
+    (user_id is not null and anonymous_id is null) or 
+    (user_id is null and anonymous_id is not null)
+  )
+);
+
+-- Indexes for performance
+create index if not exists player_profiles_user_id_idx on public.player_profiles(user_id);
+create index if not exists player_profiles_anonymous_id_idx on public.player_profiles(anonymous_id);
+create index if not exists player_profiles_skill_level_idx on public.player_profiles(skill_level);
+
+-- Behavioral Profiling (Lightweight, Heuristic-Based)
 create table if not exists public.player_behavior_profiles (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.game_sessions(id) on delete cascade,
@@ -90,9 +239,9 @@ create table if not exists public.player_behavior_profiles (
 create index if not exists player_behavior_profiles_session_idx 
 on public.player_behavior_profiles(session_id);
 
--- -----------------------------------------------------
--- RPC Functions for In-Database Intelligence
--- -----------------------------------------------------
+-- =====================================================
+-- STEP 5: CREATE RPC FUNCTIONS (v2.0)
+-- =====================================================
 
 -- Main decision engine: calculates next optimal move
 create or replace function public.get_next_move_v2(p_session_id uuid)
@@ -335,6 +484,10 @@ as $$
   where gs.id = p_session_id;
 $$;
 
+-- =====================================================
+-- STEP 6: CREATE TRIGGERS
+-- =====================================================
+
 -- Update timestamp trigger
 create or replace function public.update_updated_at_column()
 returns trigger as $$
@@ -355,6 +508,25 @@ create trigger update_active_sessions_v2_updated_at
   before update on public.active_sessions_v2
   for each row execute function public.update_updated_at_column();
 
+drop trigger if exists update_players_updated_at on public.players;
+create trigger update_players_updated_at
+  before update on public.players
+  for each row execute function public.update_updated_at_column();
+
+drop trigger if exists update_attributes_updated_at on public.attributes;
+create trigger update_attributes_updated_at
+  before update on public.attributes
+  for each row execute function public.update_updated_at_column();
+
+drop trigger if exists update_game_sessions_updated_at on public.game_sessions;
+create trigger update_game_sessions_updated_at
+  before update on public.game_sessions
+  for each row execute function public.update_updated_at_column();
+
+-- =====================================================
+-- STEP 7: FINALIZE
+-- =====================================================
+
 commit;
 
 -- Notify PostgREST to refresh schema
@@ -362,3 +534,14 @@ do $$
 begin
   perform pg_notify('pgrst', 'reload schema');
 end $$;
+
+-- Verification query
+select 
+  'Schema upgrade complete' as status,
+  count(*) as tables_created
+from information_schema.tables 
+where table_schema = 'public' 
+and table_name in (
+  'players', 'attributes', 'player_features', 'game_sessions', 
+  'active_sessions_v2', 'player_profiles', 'player_behavior_profiles'
+);

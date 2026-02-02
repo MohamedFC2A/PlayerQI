@@ -34,6 +34,9 @@ Frontend (React/Vite) ↔ Node.js Server ↔ Supabase (PostgreSQL)
 - Supabase account
 - DeepSeek API key (optional)
 
+### ⚠️ Important Database Note
+If you're upgrading from v1.0 or encountering database errors, please read [DATABASE_RESET_V2.md](DATABASE_RESET_V2.md) first!
+
 ### Installation
 
 ```bash
@@ -48,9 +51,9 @@ npm install
 cp .env.example .env
 # Edit .env with your configuration
 
-# Apply database schema
+# Apply database schema (READ DATABASE_RESET_V2.md FIRST!)
 cd server/supabase
-psql $YOUR_DATABASE_URL -f schema_v2.sql
+psql $YOUR_DATABASE_URL -f reset_and_upgrade_v2.sql
 
 # Start development servers
 cd ../..
