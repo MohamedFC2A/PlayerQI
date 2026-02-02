@@ -17,6 +17,14 @@ function normalizeSimpleText(input) {
   if (!input) return '';
   return String(input)
     .toLowerCase()
+    .replace(/[\u064B-\u0652\u0670]/g, '')
+    .replace(/\u0640/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -32,13 +40,17 @@ function toAnswerKind(input) {
 }
 
 const FALLBACK_QUESTIONS = [
-  'هل لعب في أحد الدوريات الخمسة الكبرى؟',
   'هل هو لاعب معتزل؟',
   'هل يلعب كمهاجم؟',
   'هل يلعب في أوروبا؟',
   'هل فاز بدوري أبطال أوروبا؟',
   'هل فاز بكأس العالم؟',
   'هل يلعب في منتخب بلاده؟',
+  'هل يلعب في أحد الدوريات الخمسة الكبرى؟',
+  'هل لعب لنادٍ كبير في أوروبا؟',
+  'هل هو حارس مرمى؟',
+  'هل يلعب كمدافع؟',
+  'هل يلعب في خط الوسط؟',
 ];
 
 function pickFallbackQuestion(history) {
@@ -47,10 +59,9 @@ function pickFallbackQuestion(history) {
       .map((h) => normalizeSimpleText(h?.question))
       .filter(Boolean),
   );
-  for (const q of FALLBACK_QUESTIONS) {
-    if (!asked.has(normalizeSimpleText(q))) return q;
-  }
-  return FALLBACK_QUESTIONS[0];
+  const available = FALLBACK_QUESTIONS.filter((q) => !asked.has(normalizeSimpleText(q)));
+  const pool = available.length > 0 ? available : FALLBACK_QUESTIONS;
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 async function upsertPlayerByGuessName(guessName) {
@@ -136,29 +147,41 @@ app.post('/api/game', async (req, res) => {
     let move = null;
     let error = null;
 
+    const buildCurrentHistory = () => history.map((h) => ({
+      attribute_id: h?.attribute_id ?? h?.feature_id ?? h?.featureId ?? null,
+      normalized_question: normalizeSimpleText(h?.question ?? ''),
+      answer_kind: toAnswerKind(h?.answer),
+    }));
+
     if (history.length === 0) {
       const result = await supabase.rpc('game_start');
       move = result?.data ?? null;
       error = result?.error ?? null;
     } else if (sessionId) {
       const last = history[history.length - 1] ?? null;
-      const result = await supabase.rpc('game_step', {
-        p_session_id: sessionId,
-        p_question_id: last?.question_id ?? last?.questionId ?? null,
-        p_attribute_id: last?.attribute_id ?? last?.feature_id ?? last?.featureId ?? null,
-        p_answer: toAnswerKind(last?.answer),
-        p_rejected_guess_names: rejectedGuessNames,
-      });
-      move = result?.data ?? null;
-      error = result?.error ?? null;
+      const lastAttributeId = last?.attribute_id ?? last?.feature_id ?? last?.featureId ?? null;
+      if (lastAttributeId) {
+        const result = await supabase.rpc('game_step', {
+          p_session_id: sessionId,
+          p_question_id: last?.question_id ?? last?.questionId ?? null,
+          p_attribute_id: lastAttributeId,
+          p_answer: toAnswerKind(last?.answer),
+          p_rejected_guess_names: rejectedGuessNames,
+        });
+        move = result?.data ?? null;
+        error = result?.error ?? null;
+      } else {
+        // If last question was a fallback (no attribute_id), fall back to stateless RPC
+        const result = await supabase.rpc('get_optimal_move', {
+          current_history: buildCurrentHistory(),
+          rejected_guess_names: rejectedGuessNames,
+        });
+        move = result?.data ?? null;
+        error = result?.error ?? null;
+      }
     } else {
-      const currentHistory = history.map((h) => ({
-        attribute_id: h?.attribute_id ?? h?.feature_id ?? h?.featureId ?? null,
-        normalized_question: normalizeSimpleText(h?.question ?? ''),
-        answer_kind: toAnswerKind(h?.answer),
-      }));
       const result = await supabase.rpc('get_optimal_move', {
-        current_history: currentHistory,
+        current_history: buildCurrentHistory(),
         rejected_guess_names: rejectedGuessNames,
       });
       move = result?.data ?? null;
@@ -166,7 +189,16 @@ app.post('/api/game', async (req, res) => {
     }
 
     if (error) {
-      return res.json({ type: 'question', content: pickFallbackQuestion(history) });
+      // Try stateless RPC before using fallback
+      const retry = await supabase.rpc('get_optimal_move', {
+        current_history: buildCurrentHistory(),
+        rejected_guess_names: rejectedGuessNames,
+      });
+      move = retry?.data ?? null;
+      error = retry?.error ?? null;
+      if (error || !move) {
+        return res.json({ type: 'question', content: pickFallbackQuestion(history) });
+      }
     }
 
     if (move?.type === 'guess' && move?.content) {
