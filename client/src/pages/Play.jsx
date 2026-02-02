@@ -81,8 +81,8 @@ export default function Play() {
     };
 
     const startGame = async () => {
-        setStarted(true);
-        setShowReplayPrompt(false);
+        // CRITICAL: Ensure complete state reset
+        setStarted(false); // Temporarily set to false to trigger re-render
         setHistory([]);
         setCurrentQuestion(null);
         setCurrentQuestionMeta(null);
@@ -92,9 +92,16 @@ export default function Play() {
         setVerification(null);
         setEditableHistory([]);
         setFinalizing(false);
-        setRejectedGuesses([]);
-        setSessionId(null);
-        await fetchNextMove([], []);
+        setRejectedGuesses([]); // Clear rejected guesses
+        setSessionId(null); // Clear session ID
+        setShowReplayPrompt(false);
+        
+        // Small delay to ensure state is completely cleared
+        setTimeout(async () => {
+            setStarted(true);
+            // Pass empty arrays to ensure fresh start
+            await fetchNextMove([], []);
+        }, 50);
     };
 
     const handleAnswer = async (answer) => {
