@@ -25,7 +25,16 @@ const Particle = ({ delay, x }) => (
     />
 );
 
-export default function ResultCard({ guess, reason, imageUrl, onReset, onConfirm, confirming, feedback }) {
+export default function ResultCard({ guess, reason, imageUrl, details, onReset, onConfirm, confirming, feedback }) {
+    const attributes = details?.attributes && typeof details.attributes === 'object' ? details.attributes : null;
+    const labels = {
+        type: 'النوع',
+        born: 'الميلاد',
+        nationality: 'الجنسية',
+        team: 'النادي/الفريق',
+        height: 'الطول',
+    };
+
     return (
         <motion.div
             initial={{ opacity: 0, scale: 0.8, y: 50 }}
@@ -110,13 +119,50 @@ export default function ResultCard({ guess, reason, imageUrl, onReset, onConfirm
                 </motion.div>
             )}
 
+            {(details?.description || (attributes && Object.keys(attributes).length > 0)) && (
+                <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.55 }}
+                    className="rounded-2xl border border-white/10 bg-white/5 p-5 text-white text-sm leading-relaxed space-y-3"
+                >
+                    {details?.description && (
+                        <div className="text-white/90">
+                            {details.description}
+                        </div>
+                    )}
+
+                    {attributes && Object.keys(attributes).length > 0 && (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {Object.entries(attributes).slice(0, 6).map(([k, v]) => (
+                                <div key={k} className="rounded-xl bg-black/20 border border-white/10 px-3 py-2 flex items-center justify-between gap-3">
+                                    <span className="text-white/70 text-xs">{labels[k] || k}</span>
+                                    <span className="text-white text-xs font-semibold">{String(v)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {details?.sourceUrl && (
+                        <a
+                            href={details.sourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex text-xs text-blue-200 hover:text-blue-100 underline underline-offset-4"
+                        >
+                            مصدر المعلومات
+                        </a>
+                    )}
+                </motion.div>
+            )}
+
             {/* Reason box */}
             {Boolean(reason) && (
                 <motion.div
                     initial={{ opacity: 0, scale: 0.9 }}
                     animate={{ opacity: 1, scale: 1 }}
                     transition={{ delay: 0.6 }}
-                    className="bg-black/30 rounded-xl p-5 text-slate-200/90 text-sm leading-relaxed border border-white/5 backdrop-blur-sm"
+                    className="bg-black/30 rounded-2xl p-5 text-white/90 text-sm leading-relaxed border border-white/10 backdrop-blur-sm"
                 >
                     <div className="flex items-start gap-2">
                         <Sparkles size={16} className="text-blue-400 mt-0.5 shrink-0" />

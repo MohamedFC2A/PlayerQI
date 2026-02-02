@@ -3,6 +3,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
 const OpenAI = require('openai');
+const axios = require('axios');
 const { createSupabaseClient } = require('./supabaseClient');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -24,6 +25,21 @@ function createDeepSeekClient() {
 }
 
 const deepseek = createDeepSeekClient();
+
+function createSerperClient() {
+  const apiKey = process.env.SERPER_API_KEY;
+  if (!apiKey) return null;
+  return axios.create({
+    baseURL: 'https://google.serper.dev',
+    headers: {
+      'X-API-KEY': apiKey,
+      'Content-Type': 'application/json',
+    },
+    timeout: 12_000,
+  });
+}
+
+const serper = createSerperClient();
 
 function normalizeSimpleText(input) {
   if (!input) return '';
@@ -49,6 +65,93 @@ function toAnswerKind(input) {
   if (['maybe', 'ربما', 'جزئيا', 'جزئياً'].includes(a)) return 'maybe';
   if (['unknown', 'idk', 'لا اعرف', 'لا أعرف'].includes(a)) return 'unknown';
   return 'unknown';
+}
+
+async function fetchSerperPlayerProfile(playerName) {
+  if (!serper || !playerName) return null;
+
+  const query = `${playerName} football player`;
+
+  const [searchResp, imagesResp] = await Promise.all([
+    serper.post('/search', { q: query, gl: 'us', hl: 'en' }).catch(() => null),
+    serper.post('/images', { q: playerName, gl: 'us', hl: 'en' }).catch(() => null),
+  ]);
+
+  const searchData = searchResp?.data ?? null;
+  const imagesData = imagesResp?.data ?? null;
+
+  const kg = searchData?.knowledgeGraph ?? null;
+  const organic = Array.isArray(searchData?.organic) ? searchData.organic : [];
+
+  const images = Array.isArray(imagesData?.images) ? imagesData.images : [];
+
+  const imageUrl =
+    kg?.imageUrl
+    || images.find((i) => typeof i?.imageUrl === 'string')?.imageUrl
+    || images.find((i) => typeof i?.thumbnailUrl === 'string')?.thumbnailUrl
+    || null;
+
+  const description =
+    (typeof kg?.description === 'string' ? kg.description : null)
+    || (typeof organic?.[0]?.snippet === 'string' ? organic[0].snippet : null)
+    || null;
+
+  const sourceUrl =
+    (typeof kg?.website === 'string' ? kg.website : null)
+    || (typeof organic?.[0]?.link === 'string' ? organic[0].link : null)
+    || null;
+
+  const title =
+    (typeof kg?.title === 'string' ? kg.title : null)
+    || playerName;
+
+  const attributes = {};
+  if (typeof kg?.type === 'string') attributes.type = kg.type;
+  if (typeof kg?.born === 'string') attributes.born = kg.born;
+  if (typeof kg?.nationality === 'string') attributes.nationality = kg.nationality;
+  if (typeof kg?.team === 'string') attributes.team = kg.team;
+  if (typeof kg?.height === 'string') attributes.height = kg.height;
+
+  return {
+    imageUrl,
+    details: {
+      title,
+      description,
+      sourceUrl,
+      attributes,
+    },
+  };
+}
+
+async function hydrateGuessPresentation({ playerName }) {
+  if (!playerName) return { imageUrl: null, details: null };
+
+  // Prefer stored image_url if the player exists in Supabase.
+  if (supabase) {
+    const normalized = normalizeSimpleText(playerName);
+    const { data: existing } = await supabase
+      .from('players')
+      .select('id,name,image_url')
+      .eq('normalized_name', normalized)
+      .maybeSingle();
+
+    if (existing?.image_url) {
+      return { imageUrl: existing.image_url, details: null };
+    }
+  }
+
+  const profile = await fetchSerperPlayerProfile(playerName);
+  const imageUrl = profile?.imageUrl ?? null;
+  const details = profile?.details ?? null;
+
+  if (supabase && imageUrl) {
+    const normalized = normalizeSimpleText(playerName);
+    await supabase
+      .from('players')
+      .upsert([{ name: playerName, normalized_name: normalized, image_url: imageUrl, prior_weight: 1 }], { onConflict: 'normalized_name' });
+  }
+
+  return { imageUrl, details };
 }
 
 function buildFootballOracleSystemPrompt({ history, rejectedGuesses, questionNumber }) {
@@ -172,6 +275,11 @@ async function generateOracleMove({ history, rejectedGuesses }) {
   const rejected = new Set((Array.isArray(rejectedGuesses) ? rejectedGuesses : []).map(normalizeSimpleText).filter(Boolean));
   if (type === 'guess' && rejected.has(normalizeSimpleText(contentText))) {
     return null;
+  }
+
+  if (type === 'guess') {
+    const presentation = await hydrateGuessPresentation({ playerName: contentText });
+    return { type, content: contentText, imageUrl: presentation.imageUrl, details: presentation.details };
   }
 
   return { type, content: contentText };
@@ -720,11 +828,14 @@ app.post('/api/game', async (req, res) => {
 
     // Guess if only one candidate remains or the top prior is overwhelming.
     if (summary.candidate_count === 1 || topProb >= 0.9) {
+      const presentation = await hydrateGuessPresentation({ playerName: summary.top_player_name ?? null });
       const move = {
         type: 'guess',
         content: summary.top_player_name ?? null,
         confidence: topProb,
         meta: metaBase,
+        imageUrl: presentation.imageUrl,
+        details: presentation.details,
       };
 
       await persistSessionState({
@@ -743,7 +854,8 @@ app.post('/api/game', async (req, res) => {
         confidence: topProb,
         meta: metaBase,
         session_id: sessionId ?? null,
-        imageUrl: null,
+        imageUrl: presentation.imageUrl,
+        details: presentation.details,
       });
     }
 
@@ -880,6 +992,7 @@ app.post('/api/confirm', async (req, res) => {
 
     const player = await upsertPlayerByGuessName(guess);
     const playerId = player?.id ?? null;
+    const presentation = await hydrateGuessPresentation({ playerName: guess });
 
     if (sessionId) {
       await supabase
@@ -902,7 +1015,8 @@ app.post('/api/confirm', async (req, res) => {
       stored: Boolean(sessionId),
       correct: true,
       playerId,
-      imageUrl: player?.image_url ?? null,
+      imageUrl: player?.image_url ?? presentation.imageUrl ?? null,
+      details: presentation.details ?? null,
       sessionId: sessionId ?? null,
       reviewRequired: false,
     });
@@ -926,6 +1040,7 @@ app.post('/api/confirm-final', async (req, res) => {
 
     const player = await upsertPlayerByGuessName(guess);
     const playerId = player?.id ?? null;
+    const presentation = await hydrateGuessPresentation({ playerName: guess });
 
     if (sessionId) {
       await supabase
@@ -943,7 +1058,14 @@ app.post('/api/confirm-final', async (req, res) => {
     await learnPlayerAttributesFromHistory(playerId, history);
     await bumpQuestionSuccessFromHistory(history);
 
-    return res.json({ ok: true, stored: Boolean(sessionId), playerId, imageUrl: player?.image_url ?? null, sessionId });
+    return res.json({
+      ok: true,
+      stored: Boolean(sessionId),
+      playerId,
+      imageUrl: player?.image_url ?? presentation.imageUrl ?? null,
+      details: presentation.details ?? null,
+      sessionId,
+    });
   } catch {
     return res.status(500).json({ error: 'server_error' });
   }

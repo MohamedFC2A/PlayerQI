@@ -29,6 +29,7 @@ export default function Play() {
     const [verification, setVerification] = useState(null);
     const [editableHistory, setEditableHistory] = useState([]);
     const [finalizing, setFinalizing] = useState(false);
+    const [showReplayPrompt, setShowReplayPrompt] = useState(false);
 
     const verificationMap = useMemo(() => {
         const items = verification?.items ?? [];
@@ -81,6 +82,16 @@ export default function Play() {
 
     const startGame = async () => {
         setStarted(true);
+        setShowReplayPrompt(false);
+        setHistory([]);
+        setCurrentQuestion(null);
+        setCurrentQuestionMeta(null);
+        setPrediction(null);
+        setGuessFeedback(null);
+        setReviewRequired(false);
+        setVerification(null);
+        setEditableHistory([]);
+        setFinalizing(false);
         setRejectedGuesses([]);
         setSessionId(null);
         await fetchNextMove([], []);
@@ -115,6 +126,7 @@ export default function Play() {
         setVerification(null);
         setEditableHistory([]);
         setFinalizing(false);
+        setShowReplayPrompt(false);
     };
 
     const setAnswerAt = (index, answer) => {
@@ -136,8 +148,15 @@ export default function Play() {
         setFinalizing(true);
         try {
             const result = await finalizeGuessConfirmation({ history: editableHistory, guess: prediction.content, sessionId });
-            if (result?.imageUrl && !prediction.imageUrl) {
-                setPrediction({ ...prediction, imageUrl: result.imageUrl });
+            if (result?.imageUrl || result?.details) {
+                setPrediction((prev) => {
+                    if (!prev) return prev;
+                    return {
+                        ...prev,
+                        imageUrl: prev.imageUrl || result.imageUrl || null,
+                        details: prev.details || result.details || null,
+                    };
+                });
             }
             setGuessFeedback('saved');
             setReviewRequired(false);
@@ -161,8 +180,15 @@ export default function Play() {
                 sessionId
             });
 
-            if (result?.imageUrl && !prediction.imageUrl) {
-                setPrediction({ ...prediction, imageUrl: result.imageUrl });
+            if (result?.imageUrl || result?.details) {
+                setPrediction((prev) => {
+                    if (!prev) return prev;
+                    return {
+                        ...prev,
+                        imageUrl: prev.imageUrl || result.imageUrl || null,
+                        details: prev.details || result.details || null,
+                    };
+                });
             }
 
             if (!correct) {
@@ -191,6 +217,8 @@ export default function Play() {
             }
 
             setGuessFeedback('saved');
+            setPrediction(null);
+            setShowReplayPrompt(true);
         } catch (error) {
             console.error(error);
             alert('حدث خطأ أثناء حفظ النتيجة، حاول مرة أخرى.');
@@ -207,7 +235,28 @@ export default function Play() {
                 </div>
             )}
 
-            {started && !prediction && (
+            {started && showReplayPrompt && (
+                <div className="glass-card p-8 md:p-10 text-center space-y-5">
+                    <div className="text-white font-black text-2xl">تم التخمين بنجاح</div>
+                    <div className="text-white/80 text-sm">
+                        هل تريد إعادة اللعب مرة أخرى؟
+                    </div>
+                    <button
+                        onClick={startGame}
+                        className="glass-button w-full py-4 rounded-2xl font-black text-base text-white bg-gradient-to-r from-blue-600/40 to-blue-500/30 border-blue-400/30"
+                    >
+                        ابدأ لعبة جديدة
+                    </button>
+                    <button
+                        onClick={resetGame}
+                        className="glass-button w-full py-3 rounded-2xl font-bold text-sm text-white bg-white/5 border-white/10"
+                    >
+                        رجوع للصفحة الرئيسية
+                    </button>
+                </div>
+            )}
+
+            {started && !prediction && !showReplayPrompt && (
                 <div className="space-y-6 w-full flex flex-col items-center">
                     <div className="w-full max-w-2xl space-y-2">
                         <div className="flex justify-between text-blue-200 text-sm font-medium px-1">
@@ -240,6 +289,7 @@ export default function Play() {
                         guess={prediction.content}
                         reason={prediction.reason}
                         imageUrl={prediction.imageUrl}
+                        details={prediction.details}
                         onReset={resetGame}
                         onConfirm={handleGuessConfirm}
                         confirming={confirming}
