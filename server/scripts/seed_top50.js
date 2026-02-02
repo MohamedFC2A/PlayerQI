@@ -1,4 +1,5 @@
 /* eslint-disable no-console */
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { createClient } = require('@supabase/supabase-js');
 
 function requireEnv(name) {
@@ -404,4 +405,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-
