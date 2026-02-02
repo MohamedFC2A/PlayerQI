@@ -556,10 +556,10 @@ as $$
     )
   select
     count(*)::integer as candidate_count,
-    (select id from filtered order by prior_weight desc, name asc limit 1) as top_player_id,
-    (select name from filtered order by prior_weight desc, name asc limit 1) as top_player_name,
+    (select id from filtered order by prior_weight desc, random() limit 1) as top_player_id,
+    (select name from filtered order by prior_weight desc, random() limit 1) as top_player_name,
     coalesce(sum(prior_weight), 0)::numeric as total_weight,
-    coalesce((select prior_weight from filtered order by prior_weight desc, name asc limit 1), 0)::numeric as top_weight
+    coalesce((select prior_weight from filtered order by prior_weight desc, random() limit 1), 0)::numeric as top_weight
   from filtered;
 $$;
 
