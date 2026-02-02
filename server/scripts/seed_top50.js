@@ -161,6 +161,8 @@ function buildAttributes() {
       attribute_value: item.value,
       label_ar: item.label_ar,
       category: 'Geography',
+      attribute_group: 'continent',
+      is_exclusive: true,
       normalized_key: 'continent',
       normalized_value: normalizeSimpleText(item.value),
     });
@@ -171,6 +173,8 @@ function buildAttributes() {
       attribute_value: item.value,
       label_ar: item.label_ar,
       category: 'Position',
+      attribute_group: 'position',
+      is_exclusive: true,
       normalized_key: 'position',
       normalized_value: normalizeSimpleText(item.value),
     });
@@ -181,6 +185,8 @@ function buildAttributes() {
       attribute_value: item.value,
       label_ar: item.label_ar,
       category: 'Competition',
+      attribute_group: 'league',
+      is_exclusive: true,
       normalized_key: 'league',
       normalized_value: normalizeSimpleText(item.value),
     });
@@ -190,6 +196,8 @@ function buildAttributes() {
     attribute_value: 'retired',
     label_ar: ATTRIBUTE_SETS.retired[0].label_ar,
     category: 'Career',
+    attribute_group: 'retired',
+    is_exclusive: true,
     normalized_key: 'retired',
     normalized_value: 'retired',
   });
@@ -200,6 +208,8 @@ function buildAttributes() {
       attribute_value: n.value,
       label_ar: n.label_ar,
       category: 'Identity',
+      attribute_group: 'nationality',
+      is_exclusive: true,
       normalized_key: 'nationality',
       normalized_value: normalizeSimpleText(n.value),
     });
@@ -211,6 +221,8 @@ function buildAttributes() {
       attribute_value: c.value,
       label_ar: c.label_ar,
       category: 'Club',
+      attribute_group: 'club',
+      is_exclusive: true,
       normalized_key: 'club',
       normalized_value: normalizeSimpleText(c.value),
     });
@@ -222,6 +234,8 @@ function buildAttributes() {
       attribute_value: a.value,
       label_ar: a.label_ar,
       category: 'Achievements',
+      attribute_group: 'award',
+      is_exclusive: false,
       normalized_key: 'award',
       normalized_value: normalizeSimpleText(a.value),
     });
@@ -257,7 +271,7 @@ function buildQuestionsForAttribute(key, value, labelAr) {
 
 async function main() {
   const supabase = buildSupabase();
-  console.log('Seeding players/attributes/questions/player_attributes...');
+  console.log('Seeding players/attributes/questions/player_matrix...');
 
   const playersPayload = PLAYERS.map((p) => ({
     name: p.name,
@@ -293,7 +307,7 @@ async function main() {
     .upsert(questionsPayload, { onConflict: 'attribute_id,normalized_text' });
   if (qError) throw qError;
 
-  const playerAttributesPayload = [];
+  const playerMatrixPayload = [];
   const continents = ATTRIBUTE_SETS.continent.map((x) => x.value);
   const positions = ATTRIBUTE_SETS.position.map((x) => x.value);
   const leagues = ATTRIBUTE_SETS.league.map((x) => x.value);
@@ -307,7 +321,7 @@ async function main() {
     for (const v of continents) {
       const a = attrByKeyValue.get(`continent:${normalizeSimpleText(v)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: p.continent === v,
@@ -319,7 +333,7 @@ async function main() {
     for (const v of positions) {
       const a = attrByKeyValue.get(`position:${normalizeSimpleText(v)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: p.position === v,
@@ -331,7 +345,7 @@ async function main() {
     for (const v of leagues) {
       const a = attrByKeyValue.get(`league:${normalizeSimpleText(v)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: p.league === v,
@@ -343,7 +357,7 @@ async function main() {
     for (const v of nationalities) {
       const a = attrByKeyValue.get(`nationality:${normalizeSimpleText(v)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: p.nationality === v,
@@ -355,7 +369,7 @@ async function main() {
     for (const v of clubs) {
       const a = attrByKeyValue.get(`club:${normalizeSimpleText(v)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: p.club === v,
@@ -366,7 +380,7 @@ async function main() {
 
     const retiredAttr = attrByKeyValue.get('retired:retired');
     if (retiredAttr?.id) {
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: retiredAttr.id,
         value: Boolean(p.retired),
@@ -379,7 +393,7 @@ async function main() {
     for (const aKey of awards) {
       const a = attrByKeyValue.get(`award:${normalizeSimpleText(aKey)}`);
       if (!a?.id) continue;
-      playerAttributesPayload.push({
+      playerMatrixPayload.push({
         player_id: playerRow.id,
         attribute_id: a.id,
         value: true,
@@ -390,18 +404,24 @@ async function main() {
   }
 
   const { error: paError } = await supabase
-    .from('player_attributes')
-    .upsert(playerAttributesPayload, { onConflict: 'player_id,attribute_id' });
+    .from('player_matrix')
+    .upsert(playerMatrixPayload, { onConflict: 'player_id,attribute_id' });
   if (paError) throw paError;
+
+  const { error: refreshError } = await supabase.rpc('refresh_player_matrix_mvs');
+  if (refreshError) {
+    console.warn('Materialized view refresh failed:', refreshError.message ?? refreshError);
+  }
 
   console.log(`Done.`);
   console.log(`Players: ${playersPayload.length}`);
   console.log(`Attributes: ${attrsPayload.length}`);
   console.log(`Questions: ${questionsPayload.length}`);
-  console.log(`Player Attributes (upserted): ${playerAttributesPayload.length}`);
+  console.log(`Player Matrix (upserted): ${playerMatrixPayload.length}`);
 }
 
 main().catch((err) => {
   console.error(err);
   process.exitCode = 1;
 });
+

@@ -19,8 +19,14 @@ begin
   if to_regclass('public.questions') is not null then
     execute 'truncate table public.questions restart identity cascade';
   end if;
-  if to_regclass('public.player_attributes') is not null then
-    execute 'truncate table public.player_attributes restart identity cascade';
+  if to_regclass('public.player_matrix') is not null then
+    execute 'truncate table public.player_matrix restart identity cascade';
+  end if;
+  if to_regclass('public.active_sessions') is not null then
+    execute 'truncate table public.active_sessions restart identity cascade';
+  end if;
+  if to_regclass('public.learning_queue') is not null then
+    execute 'truncate table public.learning_queue restart identity cascade';
   end if;
   if to_regclass('public.attributes') is not null then
     execute 'truncate table public.attributes restart identity cascade';
@@ -52,7 +58,9 @@ select jsonb_build_object(
   'players_exists', (to_regclass('public.players') is not null),
   'attributes_exists', (to_regclass('public.attributes') is not null),
   'questions_exists', (to_regclass('public.questions') is not null),
-  'player_attributes_exists', (to_regclass('public.player_attributes') is not null),
+  'player_matrix_exists', (to_regclass('public.player_matrix') is not null),
+  'active_sessions_exists', (to_regclass('public.active_sessions') is not null),
+  'learning_queue_exists', (to_regclass('public.learning_queue') is not null),
   'game_sessions_exists', (to_regclass('public.game_sessions') is not null),
   'legacy_candidates_exists', (to_regclass('public.candidates') is not null),
   'legacy_features_exists', (to_regclass('public.features') is not null),
