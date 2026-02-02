@@ -23,6 +23,18 @@ begin
   end if;
 end $$;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public' and t.typname = 'project_changelog_update_type'
+  ) then
+    create type public.project_changelog_update_type as enum ('MAJOR_VERSION','FEATURE_UPDATE','HOTFIX');
+  end if;
+end $$;
+
 -- -----------------------------------------------------
 -- Wipe legacy objects (safe for database resets)
 -- -----------------------------------------------------
@@ -58,6 +70,8 @@ drop table if exists public.active_sessions cascade;
 
 drop table if exists public.game_moves cascade;
 drop table if exists public.game_sessions cascade;
+
+drop table if exists public.project_changelogs cascade;
 
 drop table if exists public.player_matrix cascade;
 drop table if exists public.questions cascade;
@@ -221,6 +235,23 @@ create table public.learning_queue (
 
 create index if not exists learning_queue_processed
 on public.learning_queue(processed_at, created_at desc);
+
+-- -----------------------------------------------------
+-- Automated changelog pipeline
+-- -----------------------------------------------------
+create table public.project_changelogs (
+  id uuid primary key default gen_random_uuid(),
+  version text not null,
+  update_type public.project_changelog_update_type not null,
+  release_date timestamptz not null default now(),
+  summary text,
+  features jsonb not null default '[]'::jsonb,
+  fixes jsonb not null default '[]'::jsonb,
+  is_published boolean not null default true
+);
+
+create index if not exists project_changelogs_published_date
+on public.project_changelogs(is_published, release_date desc);
 
 -- -----------------------------------------------------
 -- "Table Editor" friendly view (single base table => updatable)

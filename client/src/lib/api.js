@@ -33,3 +33,13 @@ export const finalizeGuessConfirmation = async ({ history, guess, sessionId = nu
         throw error;
     }
 };
+
+export const fetchChangelog = async (limit = 50) => {
+    try {
+        const response = await api.get('/changelog', { params: { limit } });
+        return response.data;
+    } catch (error) {
+        console.error('API Error:', error);
+        throw error;
+    }
+};

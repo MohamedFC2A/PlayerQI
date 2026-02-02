@@ -3,6 +3,7 @@ import Shell from './components/Shell';
 import Home from './pages/Home';
 import Play from './pages/Play';
 import HowTo from './pages/HowTo';
+import Changelog from './pages/Changelog';
 
 function App() {
     return (
@@ -11,6 +12,7 @@ function App() {
                 <Route path="/" element={<Home />} />
                 <Route path="/play" element={<Play />} />
                 <Route path="/how-to" element={<HowTo />} />
+                <Route path="/changelog" element={<Changelog />} />
             </Route>
         </Routes>
     );

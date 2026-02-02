@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "build": "npm --prefix client install && npm --prefix client run build",
+    "release": "node server/scripts/generate-changelog.js",
     "start": "node server/index.js",
     "dev": "npm run dev --prefix client & npm run dev --prefix server"
   },

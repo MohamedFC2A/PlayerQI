@@ -785,6 +785,32 @@ app.post('/api/confirm-final', async (req, res) => {
   }
 });
 
+app.get('/api/changelog', async (req, res) => {
+  try {
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.floor(limitRaw))) : 50;
+
+    if (!supabase) {
+      return res.json([]);
+    }
+
+    const { data, error } = await supabase
+      .from('project_changelogs')
+      .select('id,version,update_type,release_date,summary,features,fixes,is_published')
+      .eq('is_published', true)
+      .order('release_date', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      return res.status(500).json({ error: 'supabase_error' });
+    }
+
+    return res.json(Array.isArray(data) ? data : []);
+  } catch {
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   const parts = typeof key === 'string' ? key.split('.') : [];

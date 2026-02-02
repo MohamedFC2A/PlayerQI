@@ -1,11 +1,12 @@
 import { NavLink, Outlet } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Sparkles, Play, BookOpen } from 'lucide-react';
+import { Sparkles, Play, BookOpen, History } from 'lucide-react';
 
 const navItems = [
     { to: '/', label: 'الرئيسية', icon: Sparkles },
     { to: '/play', label: 'العب الآن', icon: Play },
     { to: '/how-to', label: 'طريقة اللعب', icon: BookOpen },
+    { to: '/changelog', label: 'التحديثات', icon: History },
 ];
 
 export default function Shell() {
@@ -59,4 +60,3 @@ export default function Shell() {
         </div>
     );
 }
-
