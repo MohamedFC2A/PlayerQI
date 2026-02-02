@@ -6,6 +6,14 @@ const OpenAI = require('openai');
 const axios = require('axios');
 const { createSupabaseClient } = require('./supabaseClient');
 
+// PlayerQI v2.0 Hyper-Speed Engine Components
+const {
+  handleGameRequest,
+  handleConfirmRequest,
+  handleAnalyticsRequest,
+  knowledgeExpander
+} = require('./hyper_speed_integration');
+
 dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
@@ -1136,10 +1144,36 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Start knowledge expander in background
+if (process.env.NODE_ENV !== 'test') {
+  knowledgeExpander.startPeriodicExpansion(60); // Run every 60 minutes
+}
+
+// PlayerQI v2.0 Hyper-Speed Engine Endpoints
+app.post('/api/game/v2', handleGameRequest);
+app.post('/api/confirm/v2', handleConfirmRequest);
+app.get('/api/analytics/:sessionId', handleAnalyticsRequest);
+
+// Health check endpoint for the new engine
+app.get('/api/health/v2', (req, res) => {
+  res.json({
+    status: 'ok',
+    engine: 'hyper-speed-v2',
+    timestamp: new Date().toISOString(),
+    components: {
+      database: Boolean(supabase),
+      deduction_engine: true,
+      behavior_analyzer: true,
+      knowledge_expander: Boolean(process.env.DEEPSEEK_API_KEY)
+    }
+  });
+});
+
 if (require.main === module) {
   app.listen(PORT, () => {
     // eslint-disable-next-line no-console
-    console.log(`Server running on port ${PORT}`);
+    console.log(`PlayerQI Server v2.0 running on port ${PORT}`);
+    console.log('Hyper-Speed Cognitive Engine activated');
   });
 }
 
